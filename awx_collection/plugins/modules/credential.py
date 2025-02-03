@@ -46,6 +46,7 @@ options:
     organization:
       description:
         - Organization name, ID, or named URL that should own the credential.
+        - This parameter is mutually exclusive with C(team) and C(user).
       type: str
     credential_type:
       description:
@@ -57,6 +58,7 @@ options:
           Insights, Machine, Microsoft Azure Key Vault, Microsoft Azure Resource Manager, Network, OpenShift or Kubernetes API
           Bearer Token, OpenStack, Red Hat Ansible Automation Platform, Red Hat Satellite 6, Red Hat Virtualization, Source Control,
           Thycotic DevOps Secrets Vault, Thycotic Secret Server, Vault, VMware vCenter, or a custom credential type
+      required: True
       type: str
     inputs:
       description:
@@ -83,6 +85,8 @@ options:
         - vault_id (the vault identifier; this parameter is only valid if C(kind) is specified as C(vault).)
         - ssh_key_unlock (unlock password for ssh_key; use "ASK" and launch job to be prompted)
         - gpg_public_key (GPG Public Key used for signature validation)
+        - client_id (client ID insights type service account)
+        - client_secret (client secret insights type service account)
       type: dict
     update_secrets:
       description:
@@ -93,10 +97,12 @@ options:
     user:
       description:
         - User name, ID, or named URL that should own this credential.
+        - This parameter is mutually exclusive with C(organization) and C(team).
       type: str
     team:
       description:
         - Team name, ID, or named URL that should own this credential.
+        - This parameter is mutually exclusive with C(organization) and C(user).
       type: str
     state:
       description:
@@ -211,7 +217,7 @@ def main():
         copy_from=dict(),
         description=dict(),
         organization=dict(),
-        credential_type=dict(),
+        credential_type=dict(required=True),
         inputs=dict(type='dict', no_log=True),
         update_secrets=dict(type='bool', default=True, no_log=False),
         user=dict(),
@@ -219,8 +225,13 @@ def main():
         state=dict(choices=['present', 'absent', 'exists'], default='present'),
     )
 
+    mutually_exclusive = [("organization", "user", "team")]
+
     # Create a module for ourselves
-    module = ControllerAPIModule(argument_spec=argument_spec)
+    module = ControllerAPIModule(
+        argument_spec=argument_spec,
+        mutually_exclusive=mutually_exclusive
+    )
 
     # Extract our parameters
     name = module.params.get('name')

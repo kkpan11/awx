@@ -20,13 +20,14 @@ from django.core.exceptions import FieldDoesNotExist
 # REST Framework
 from rest_framework.exceptions import ParseError
 
+from ansible_base.lib.utils.models import prevent_search
+
 # AWX
 from awx.api.versioning import reverse
 from awx.main.constants import HOST_FACTS_FIELDS
 from awx.main.models.base import (
     BaseModel,
     CreatedModifiedModel,
-    prevent_search,
     accepts_json,
     JOB_TYPE_CHOICES,
     NEW_JOB_TYPE_CHOICES,
@@ -204,6 +205,9 @@ class JobTemplate(UnifiedJobTemplate, JobOptions, SurveyJobTemplateMixin, Resour
     class Meta:
         app_label = 'main'
         ordering = ('name',)
+        permissions = [('execute_jobtemplate', 'Can run this job template')]
+        # Remove add permission, ability to add comes from use permission for inventory, project, credentials
+        default_permissions = ('change', 'delete', 'view')
 
     job_type = models.CharField(
         max_length=64,
@@ -624,7 +628,7 @@ class Job(UnifiedJob, JobOptions, SurveyJobMixin, JobNotificationMixin, TaskMana
         return reverse('api:job_detail', kwargs={'pk': self.pk}, request=request)
 
     def get_ui_url(self):
-        return urljoin(settings.TOWER_URL_BASE, "/#/jobs/playbook/{}".format(self.pk))
+        return urljoin(settings.TOWER_URL_BASE, "{}/jobs/playbook/{}".format(settings.OPTIONAL_UI_URL_PREFIX, self.pk))
 
     def _set_default_dependencies_processed(self):
         """
@@ -1141,7 +1145,6 @@ class SystemJobOptions(BaseModel):
         ('cleanup_jobs', _('Remove jobs older than a certain number of days')),
         ('cleanup_activitystream', _('Remove activity stream entries older than a certain number of days')),
         ('cleanup_sessions', _('Removes expired browser sessions from the database')),
-        ('cleanup_tokens', _('Removes expired OAuth 2 access tokens and refresh tokens')),
     ]
 
     class Meta:
@@ -1271,7 +1274,7 @@ class SystemJob(UnifiedJob, SystemJobOptions, JobNotificationMixin):
         return reverse('api:system_job_detail', kwargs={'pk': self.pk}, request=request)
 
     def get_ui_url(self):
-        return urljoin(settings.TOWER_URL_BASE, "/#/jobs/system/{}".format(self.pk))
+        return urljoin(settings.TOWER_URL_BASE, "{}/jobs/management/{}".format(settings.OPTIONAL_UI_URL_PREFIX, self.pk))
 
     @property
     def event_class(self):

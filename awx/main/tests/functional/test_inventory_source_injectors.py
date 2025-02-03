@@ -5,12 +5,13 @@ import json
 import re
 from collections import namedtuple
 
+from awx_plugins.interfaces._temporary_private_container_api import get_incontainer_path
+
 from awx.main.tasks.jobs import RunInventoryUpdate
 from awx.main.models import InventorySource, Credential, CredentialType, UnifiedJob, ExecutionEnvironment
-from awx.main.constants import CLOUD_PROVIDERS, STANDARD_INVENTORY_UPDATE_ENV
+from awx.main.constants import STANDARD_INVENTORY_UPDATE_ENV
 from awx.main.tests import data
-from awx.main.utils.execution_environments import to_container_path
-
+from awx.main.utils.plugins import discover_available_cloud_provider_plugin_names
 from django.conf import settings
 
 DATA = os.path.join(os.path.dirname(data.__file__), 'inventory')
@@ -46,6 +47,9 @@ def generate_fake_var(element):
 
 def credential_kind(source):
     """Given the inventory source kind, return expected credential kind"""
+    if source == 'openshift_virtualization':
+        return 'kubernetes_bearer_token'
+
     return source.replace('ec2', 'aws')
 
 
@@ -107,12 +111,13 @@ def read_content(private_data_dir, raw_env, inventory_update):
             for filename in os.listdir(os.path.join(private_data_dir, subdir)):
                 filename_list.append(os.path.join(subdir, filename))
     filename_list = sorted(filename_list, key=lambda fn: inverse_env.get(os.path.join(private_data_dir, fn), [fn])[0])
+    inventory_content = ""
     for filename in filename_list:
         if filename in ('args', 'project'):
             continue  # Ansible runner
         abs_file_path = os.path.join(private_data_dir, filename)
         file_aliases[abs_file_path] = filename
-        runner_path = to_container_path(abs_file_path, private_data_dir)
+        runner_path = get_incontainer_path(abs_file_path, private_data_dir)
         if runner_path in inverse_env:
             referenced_paths.add(abs_file_path)
             alias = 'file_reference'
@@ -130,6 +135,7 @@ def read_content(private_data_dir, raw_env, inventory_update):
                 dir_contents[abs_file_path] = f.read()
             # Declare a reference to inventory plugin file if it exists
             if abs_file_path.endswith('.yml') and 'plugin: ' in dir_contents[abs_file_path]:
+                inventory_content = dir_contents[abs_file_path]
                 referenced_paths.add(abs_file_path)  # used as inventory file
             elif cache_file_regex.match(abs_file_path):
                 file_aliases[abs_file_path] = 'cache_file'
@@ -157,7 +163,11 @@ def read_content(private_data_dir, raw_env, inventory_update):
     content = {}
     for abs_file_path, file_content in dir_contents.items():
         # assert that all files laid down are used
-        if abs_file_path not in referenced_paths and abs_file_path not in ignore_files:
+        if (
+            abs_file_path not in referenced_paths
+            and get_incontainer_path(abs_file_path, private_data_dir) not in inventory_content
+            and abs_file_path not in ignore_files
+        ):
             raise AssertionError(
                 "File {} is not referenced. References and files:\n{}\n{}".format(abs_file_path, json.dumps(env, indent=4), json.dumps(dir_contents, indent=4))
             )
@@ -182,15 +192,14 @@ def create_reference_data(source_dir, env, content):
             json.dump(env, f, indent=4, sort_keys=True)
 
 
+@mock.patch('awx_plugins.interfaces._temporary_private_licensing_api.detect_server_product_name', return_value='NOT-AWX')
 @pytest.mark.django_db
-@pytest.mark.parametrize('this_kind', CLOUD_PROVIDERS)
-def test_inventory_update_injected_content(this_kind, inventory, fake_credential_factory, mock_me):
+@pytest.mark.parametrize('this_kind', discover_available_cloud_provider_plugin_names())
+def test_inventory_update_injected_content(product_name, this_kind, inventory, fake_credential_factory, mock_me):
     ExecutionEnvironment.objects.create(name='Control Plane EE', managed=True)
     ExecutionEnvironment.objects.create(name='Default Job EE', managed=False)
 
     injector = InventorySource.injectors[this_kind]
-    if injector.plugin_name is None:
-        pytest.skip('Use of inventory plugin is not enabled for this source')
 
     src_vars = dict(base_source_var='value_of_var')
     src_vars['plugin'] = injector.get_proper_name()

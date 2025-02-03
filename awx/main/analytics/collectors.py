@@ -419,7 +419,7 @@ def _events_table(since, full_path, until, tbl, where_column, project_job_create
                           resolved_action,
                           resolved_role,
                           -- '-' operator listed here:
-                          -- https://www.postgresql.org/docs/12/functions-json.html
+                          -- https://www.postgresql.org/docs/15/functions-json.html
                           -- note that operator is only supported by jsonb objects
                           -- https://www.postgresql.org/docs/current/datatype-json.html
                           (CASE WHEN event = 'playbook_on_stats' THEN {event_data} - 'artifact_data' END) as playbook_on_stats,
@@ -442,11 +442,6 @@ def _events_table(since, full_path, until, tbl, where_column, project_job_create
         return query
 
     return _copy_table(table='events', query=query(fr"replace({tbl}.event_data, '\u', '\u005cu')::jsonb"), path=full_path)
-
-
-@register('events_table', '1.5', format='csv', description=_('Automation task records'), expensive=four_hour_slicing)
-def events_table_unpartitioned(since, full_path, until, **kwargs):
-    return _events_table(since, full_path, until, '_unpartitioned_main_jobevent', 'created', **kwargs)
 
 
 @register('events_table', '1.5', format='csv', description=_('Automation task records'), expensive=four_hour_slicing)
@@ -613,3 +608,20 @@ def host_metric_table(since, full_path, until, **kwargs):
         since.isoformat(), until.isoformat(), since.isoformat(), until.isoformat()
     )
     return _copy_table(table='host_metric', query=host_metric_query, path=full_path)
+
+
+@register('host_metric_summary_monthly_table', '1.0', format='csv', description=_('HostMetricSummaryMonthly export, full sync'), expensive=trivial_slicing)
+def host_metric_summary_monthly_table(since, full_path, **kwargs):
+    query = '''
+    COPY (SELECT main_hostmetricsummarymonthly.id,
+                 main_hostmetricsummarymonthly.date,
+                 main_hostmetricsummarymonthly.license_capacity,
+                 main_hostmetricsummarymonthly.license_consumed,
+                 main_hostmetricsummarymonthly.hosts_added,
+                 main_hostmetricsummarymonthly.hosts_deleted,
+                 main_hostmetricsummarymonthly.indirectly_managed_hosts
+          FROM main_hostmetricsummarymonthly
+          ORDER BY main_hostmetricsummarymonthly.id ASC) TO STDOUT WITH CSV HEADER
+    '''
+
+    return _copy_table(table='host_metric_summary_monthly', query=query, path=full_path)

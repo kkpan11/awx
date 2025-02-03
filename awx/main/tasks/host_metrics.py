@@ -3,37 +3,99 @@ from dateutil.relativedelta import relativedelta
 import logging
 
 from django.conf import settings
-from django.db.models import Count
+from django.db.models import Count, F
 from django.db.models.functions import TruncMonth
 from django.utils.timezone import now
-from rest_framework.fields import DateTimeField
 from awx.main.dispatch import get_task_queuename
 from awx.main.dispatch.publish import task
 from awx.main.models.inventory import HostMetric, HostMetricSummaryMonthly
+from awx.main.tasks.helpers import is_run_threshold_reached
 from awx.conf.license import get_license
+from ansible_base.lib.utils.db import advisory_lock
 
-logger = logging.getLogger('awx.main.tasks.host_metric_summary_monthly')
+
+logger = logging.getLogger('awx.main.tasks.host_metrics')
+
+
+@task(queue=get_task_queuename)
+def cleanup_host_metrics():
+    if is_run_threshold_reached(getattr(settings, 'CLEANUP_HOST_METRICS_LAST_TS', None), getattr(settings, 'CLEANUP_HOST_METRICS_INTERVAL', 30) * 86400):
+        logger.info(f"Executing cleanup_host_metrics, last ran at {getattr(settings, 'CLEANUP_HOST_METRICS_LAST_TS', '---')}")
+        HostMetricTask().cleanup(
+            soft_threshold=getattr(settings, 'CLEANUP_HOST_METRICS_SOFT_THRESHOLD', 12),
+            hard_threshold=getattr(settings, 'CLEANUP_HOST_METRICS_HARD_THRESHOLD', 36),
+        )
+        logger.info("Finished cleanup_host_metrics")
 
 
 @task(queue=get_task_queuename)
 def host_metric_summary_monthly():
     """Run cleanup host metrics summary monthly task each week"""
-    if _is_run_threshold_reached(
-        getattr(settings, 'HOST_METRIC_SUMMARY_TASK_LAST_TS', None), getattr(settings, 'HOST_METRIC_SUMMARY_TASK_INTERVAL', 7) * 86400
-    ):
+    if is_run_threshold_reached(getattr(settings, 'HOST_METRIC_SUMMARY_TASK_LAST_TS', None), getattr(settings, 'HOST_METRIC_SUMMARY_TASK_INTERVAL', 7) * 86400):
         logger.info(f"Executing host_metric_summary_monthly, last ran at {getattr(settings, 'HOST_METRIC_SUMMARY_TASK_LAST_TS', '---')}")
         HostMetricSummaryMonthlyTask().execute()
         logger.info("Finished host_metric_summary_monthly")
 
 
-def _is_run_threshold_reached(setting, threshold_seconds):
-    last_time = DateTimeField().to_internal_value(setting) if setting else DateTimeField().to_internal_value('1970-01-01')
+class HostMetricTask:
+    """
+    This class provides cleanup task for HostMetric model.
+    There are two modes:
+    - soft cleanup (updates columns delete, deleted_counter and last_deleted)
+    - hard cleanup (deletes from the db)
+    """
 
-    return (now() - last_time).total_seconds() > threshold_seconds
+    def cleanup(self, soft_threshold=None, hard_threshold=None):
+        """
+        Main entrypoint, runs either soft cleanup, hard cleanup or both
+
+        :param soft_threshold: (int)
+        :param hard_threshold: (int)
+        """
+        if hard_threshold is not None:
+            self.hard_cleanup(hard_threshold)
+        if soft_threshold is not None:
+            self.soft_cleanup(soft_threshold)
+
+        settings.CLEANUP_HOST_METRICS_LAST_TS = now()
+
+    @staticmethod
+    def soft_cleanup(threshold=None):
+        if threshold is None:
+            threshold = getattr(settings, 'CLEANUP_HOST_METRICS_SOFT_THRESHOLD', 12)
+
+        try:
+            threshold = int(threshold)
+        except (ValueError, TypeError) as e:
+            raise type(e)("soft_threshold has to be convertible to number") from e
+
+        last_automation_before = now() - relativedelta(months=threshold)
+        rows = HostMetric.active_objects.filter(last_automation__lt=last_automation_before).update(
+            deleted=True, deleted_counter=F('deleted_counter') + 1, last_deleted=now()
+        )
+        logger.info(f'cleanup_host_metrics: soft-deleted records last automated before {last_automation_before}, affected rows: {rows}')
+
+    @staticmethod
+    def hard_cleanup(threshold=None):
+        if threshold is None:
+            threshold = getattr(settings, 'CLEANUP_HOST_METRICS_HARD_THRESHOLD', 36)
+
+        try:
+            threshold = int(threshold)
+        except (ValueError, TypeError) as e:
+            raise type(e)("hard_threshold has to be convertible to number") from e
+
+        last_deleted_before = now() - relativedelta(months=threshold)
+        queryset = HostMetric.objects.filter(deleted=True, last_deleted__lt=last_deleted_before)
+        rows = queryset.delete()
+        logger.info(f'cleanup_host_metrics: hard-deleted records which were soft deleted before {last_deleted_before}, affected rows: {rows[0]}')
 
 
 class HostMetricSummaryMonthlyTask:
+    LOCK_KEY = 'host_metric_summary_monthly'
+    LOCK_SESSION_TIMEOUT = 300000  # 5 minutes.
     """
+    Task runs every four hours, longer lock timeout avoids premature termination due to high db load or other latency.
     This task computes last [threshold] months of HostMetricSummaryMonthly table
     [threshold] is setting CLEANUP_HOST_METRICS_HARD_THRESHOLD
     Each record in the table represents changes in HostMetric table in one month
@@ -58,29 +120,37 @@ class HostMetricSummaryMonthlyTask:
         self.records_to_update = []
 
     def execute(self):
-        self._load_existing_summaries()
-        self._load_hosts_added()
-        self._load_hosts_deleted()
 
-        # Get first month after last hard delete
-        month = self._get_first_month()
-        license_consumed = self._get_license_consumed_before(month)
+        with advisory_lock(
+            HostMetricSummaryMonthlyTask.LOCK_KEY, lock_session_timeout_milliseconds=HostMetricSummaryMonthlyTask.LOCK_SESSION_TIMEOUT, wait=False
+        ) as acquired:
+            if not acquired:
+                logger.info("Another instance of host_metric_summary_monthly is already running. Exiting.")
+                return
 
-        # Fill record for each month
-        while month <= datetime.date.today().replace(day=1):
-            summary = self._find_or_create_summary(month)
-            # Update summary and update license_consumed by hosts added/removed this month
-            self._update_summary(summary, month, license_consumed)
-            license_consumed = summary.license_consumed
+            self._load_existing_summaries()
+            self._load_hosts_added()
+            self._load_hosts_deleted()
 
-            month = month + relativedelta(months=1)
+            # Get first month after last hard delete
+            month = self._get_first_month()
+            license_consumed = self._get_license_consumed_before(month)
 
-        # Create/Update stats
-        HostMetricSummaryMonthly.objects.bulk_create(self.records_to_create, batch_size=1000)
-        HostMetricSummaryMonthly.objects.bulk_update(self.records_to_update, ['license_consumed', 'hosts_added', 'hosts_deleted'], batch_size=1000)
+            # Fill record for each month
+            while month <= datetime.date.today().replace(day=1):
+                summary = self._find_or_create_summary(month)
+                # Update summary and update license_consumed by hosts added/removed this month
+                self._update_summary(summary, month, license_consumed)
+                license_consumed = summary.license_consumed
 
-        # Set timestamp of last run
-        settings.HOST_METRIC_SUMMARY_TASK_LAST_TS = now()
+                month = month + relativedelta(months=1)
+
+            # Create/Update stats
+            HostMetricSummaryMonthly.objects.bulk_create(self.records_to_create, batch_size=1000)
+            HostMetricSummaryMonthly.objects.bulk_update(self.records_to_update, ['license_consumed', 'hosts_added', 'hosts_deleted'], batch_size=1000)
+
+            # Set timestamp of last run
+            settings.HOST_METRIC_SUMMARY_TASK_LAST_TS = now()
 
     def _get_license_consumed_before(self, month):
         license_consumed = 0
@@ -164,7 +234,7 @@ class HostMetricSummaryMonthlyTask:
             self.records_to_update.append(summary)
         return summary
 
-    def _find_summary(self, month):
+    def _find_summary(self, month: datetime.date):
         """
         Existing summaries are ordered by month ASC.
         This method is called with month in ascending order too => only 1 traversing is enough
@@ -172,6 +242,8 @@ class HostMetricSummaryMonthlyTask:
         summary = None
         while not summary and self.existing_summaries_idx < self.existing_summaries_cnt:
             tmp = self.existing_summaries[self.existing_summaries_idx]
+            if isinstance(tmp, datetime.datetime):
+                tmp = tmp.date()
             if tmp.date < month:
                 self.existing_summaries_idx += 1
             elif tmp.date == month:

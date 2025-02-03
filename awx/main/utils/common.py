@@ -6,7 +6,7 @@ from datetime import timedelta
 import json
 import yaml
 import logging
-import time
+import psycopg
 import os
 import subprocess
 import re
@@ -17,13 +17,15 @@ import threading
 import contextlib
 import tempfile
 import functools
+from importlib.metadata import version as _get_version
+from importlib.metadata import entry_points, EntryPoint
 
 # Django
 from django.core.exceptions import ObjectDoesNotExist, FieldDoesNotExist
 from django.utils.dateparse import parse_datetime
 from django.utils.translation import gettext_lazy as _
 from django.utils.functional import cached_property
-from django.db import connection, transaction, ProgrammingError
+from django.db import connection, DatabaseError, transaction, ProgrammingError, IntegrityError
 from django.db.models.fields.related import ForeignObjectRel, ManyToManyField
 from django.db.models.fields.related_descriptors import ForwardManyToOneDescriptor, ManyToManyDescriptor
 from django.db.models.query import QuerySet
@@ -52,12 +54,10 @@ __all__ = [
     'get_awx_http_client_headers',
     'get_awx_version',
     'update_scm_url',
-    'get_type_for_model',
     'get_model_for_type',
     'copy_model_by_class',
     'copy_m2m_relationships',
     'prefetch_page_capabilities',
-    'to_python_boolean',
     'datetime_hook',
     'ignore_inventory_computed_fields',
     'ignore_inventory_group_removal',
@@ -89,7 +89,6 @@ __all__ = [
     'deepmerge',
     'get_event_partition_epoch',
     'cleanup_new_process',
-    'log_excess_runtime',
     'unified_job_class_to_event_table_name',
 ]
 
@@ -108,18 +107,6 @@ def get_object_or_400(klass, *args, **kwargs):
         raise ParseError(*e.args)
     except queryset.model.MultipleObjectsReturned as e:
         raise ParseError(*e.args)
-
-
-def to_python_boolean(value, allow_none=False):
-    value = str(value)
-    if value.lower() in ('true', '1', 't'):
-        return True
-    elif value.lower() in ('false', '0', 'f'):
-        return False
-    elif allow_none and value.lower() in ('none', 'null'):
-        return None
-    else:
-        raise ValueError(_(u'Unable to convert "%s" to boolean') % value)
 
 
 def datetime_hook(d):
@@ -150,7 +137,7 @@ def underscore_to_camelcase(s):
 @functools.cache
 def is_testing(argv=None):
     '''Return True if running django or py.test unit tests.'''
-    if 'PYTEST_CURRENT_TEST' in os.environ.keys():
+    if os.environ.get('DJANGO_SETTINGS_MODULE') == 'awx.main.tests.settings_for_test':
         return True
     argv = sys.argv if argv is None else argv
     if len(argv) >= 1 and ('py.test' in argv[0] or 'py/test.py' in argv[0]):
@@ -158,6 +145,14 @@ def is_testing(argv=None):
     elif len(argv) >= 2 and argv[1] == 'test':
         return True
     return False
+
+
+def bypass_in_test(func):
+    def fn(*args, **kwargs):
+        if not is_testing():
+            return func(*args, **kwargs)
+
+    return fn
 
 
 class RequireDebugTrueOrTest(logging.Filter):
@@ -235,9 +230,7 @@ def get_awx_version():
     from awx import __version__
 
     try:
-        import pkg_resources
-
-        return pkg_resources.require('awx')[0].version
+        return _get_version('awx')
     except Exception:
         return __version__
 
@@ -367,7 +360,7 @@ def get_allowed_fields(obj, serializer_mapping):
     else:
         allowed_fields = [x.name for x in obj._meta.fields]
 
-    ACTIVITY_STREAM_FIELD_EXCLUSIONS = {'user': ['last_login'], 'oauth2accesstoken': ['last_used'], 'oauth2application': ['client_secret']}
+    ACTIVITY_STREAM_FIELD_EXCLUSIONS = {'user': ['last_login']}
     model_name = obj._meta.model_name
     fields_excluded = ACTIVITY_STREAM_FIELD_EXCLUSIONS.get(model_name, [])
     # see definition of from_db for CredentialType
@@ -569,14 +562,6 @@ def copy_m2m_relationships(obj1, obj2, fields, kwargs=None):
                 dest_field.add(*list(src_field_value.all().values_list('id', flat=True)))
 
 
-def get_type_for_model(model):
-    """
-    Return type name for a given model class.
-    """
-    opts = model._meta.concrete_model._meta
-    return camelcase_to_underscore(opts.object_name)
-
-
 def get_model_for_type(type_name):
     """
     Return model class for a given type name.
@@ -768,14 +753,13 @@ def get_corrected_cpu(cpu_count):  # formerlly get_cpu_capacity
     return cpu_count  # no correction
 
 
-def get_cpu_effective_capacity(cpu_count):
+def get_cpu_effective_capacity(cpu_count, is_control_node=False):
     from django.conf import settings
-
-    cpu_count = get_corrected_cpu(cpu_count)
 
     settings_forkcpu = getattr(settings, 'SYSTEM_TASK_FORKS_CPU', None)
     env_forkcpu = os.getenv('SYSTEM_TASK_FORKS_CPU', None)
-
+    if is_control_node:
+        cpu_count = get_corrected_cpu(cpu_count)
     if env_forkcpu:
         forkcpu = int(env_forkcpu)
     elif settings_forkcpu:
@@ -834,6 +818,7 @@ def get_corrected_memory(memory):
 
     # Runner returns memory in bytes
     # so we convert memory from settings to bytes as well.
+
     if env_absmem is not None:
         return convert_mem_str_to_bytes(env_absmem)
     elif settings_absmem is not None:
@@ -842,14 +827,13 @@ def get_corrected_memory(memory):
     return memory
 
 
-def get_mem_effective_capacity(mem_bytes):
+def get_mem_effective_capacity(mem_bytes, is_control_node=False):
     from django.conf import settings
-
-    mem_bytes = get_corrected_memory(mem_bytes)
 
     settings_mem_mb_per_fork = getattr(settings, 'SYSTEM_TASK_FORKS_MEM', None)
     env_mem_mb_per_fork = os.getenv('SYSTEM_TASK_FORKS_MEM', None)
-
+    if is_control_node:
+        mem_bytes = get_corrected_memory(mem_bytes)
     if env_mem_mb_per_fork:
         mem_mb_per_fork = int(env_mem_mb_per_fork)
     elif settings_mem_mb_per_fork:
@@ -1111,7 +1095,11 @@ def create_temporary_fifo(data):
     path = os.path.join(tempfile.mkdtemp(), next(tempfile._get_candidate_names()))
     os.mkfifo(path, stat.S_IRUSR | stat.S_IWUSR)
 
-    threading.Thread(target=lambda p, d: open(p, 'wb').write(d), args=(path, data)).start()
+    def tmp_write(path, data):
+        with open(path, 'wb') as f:
+            f.write(data)
+
+    threading.Thread(target=tmp_write, args=(path, data)).start()
     return path
 
 
@@ -1149,6 +1137,17 @@ def deepmerge(a, b):
         return b
 
 
+def table_exists(cursor, table_name):
+    cursor.execute(f"SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = '{table_name}');")
+    row = cursor.fetchone()
+    if row is not None:
+        for val in row:  # should only have 1
+            if val is True:
+                logger.debug(f'Event partition table {table_name} already exists')
+                return True
+    return False
+
+
 def create_partition(tblname, start=None):
     """Creates new partition table for events.  By default it covers the current hour."""
     if start is None:
@@ -1165,13 +1164,37 @@ def create_partition(tblname, start=None):
     try:
         with transaction.atomic():
             with connection.cursor() as cursor:
+                if table_exists(cursor, f"{tblname}_{partition_label}"):
+                    return
+
                 cursor.execute(
-                    f'CREATE TABLE IF NOT EXISTS {tblname}_{partition_label} '
-                    f'PARTITION OF {tblname} '
-                    f'FOR VALUES FROM (\'{start_timestamp}\') to (\'{end_timestamp}\');'
+                    f'CREATE TABLE {tblname}_{partition_label} (LIKE {tblname} INCLUDING DEFAULTS INCLUDING CONSTRAINTS); '
+                    f'ALTER TABLE {tblname} ATTACH PARTITION {tblname}_{partition_label} '
+                    f'FOR VALUES FROM (\'{start_timestamp}\') TO (\'{end_timestamp}\');'
                 )
-    except ProgrammingError as e:
-        logger.debug(f'Caught known error due to existing partition: {e}')
+
+    except (ProgrammingError, IntegrityError) as e:
+        cause = e.__cause__
+        if cause and hasattr(cause, 'sqlstate'):
+            sqlstate = cause.sqlstate
+            if sqlstate is None:
+                raise
+            sqlstate_cls = psycopg.errors.lookup(sqlstate)
+
+            if sqlstate_cls in (psycopg.errors.DuplicateTable, psycopg.errors.DuplicateObject, psycopg.errors.UniqueViolation):
+                logger.info(f'Caught known error due to partition creation race: {e}')
+            else:
+                logger.error('SQL Error state: {} - {}'.format(sqlstate, sqlstate_cls))
+                raise
+    except DatabaseError as e:
+        cause = e.__cause__
+        if cause and hasattr(cause, 'sqlstate'):
+            sqlstate = cause.sqlstate
+            if sqlstate is None:
+                raise
+            sqlstate_str = psycopg.errors.lookup(sqlstate)
+            logger.error('SQL Error state: {} - {}'.format(sqlstate, sqlstate_str))
+        raise
 
 
 def cleanup_new_process(func):
@@ -1191,36 +1214,9 @@ def cleanup_new_process(func):
     return wrapper_cleanup_new_process
 
 
-def log_excess_runtime(func_logger, cutoff=5.0, debug_cutoff=5.0, msg=None, add_log_data=False):
-    def log_excess_runtime_decorator(func):
-        @functools.wraps(func)
-        def _new_func(*args, **kwargs):
-            start_time = time.time()
-            log_data = {'name': repr(func.__name__)}
-
-            if add_log_data:
-                return_value = func(*args, log_data=log_data, **kwargs)
-            else:
-                return_value = func(*args, **kwargs)
-
-            log_data['delta'] = time.time() - start_time
-            if isinstance(return_value, dict):
-                log_data.update(return_value)
-
-            if msg is None:
-                record_msg = 'Running {name} took {delta:.2f}s'
-            else:
-                record_msg = msg
-            if log_data['delta'] > cutoff:
-                func_logger.info(record_msg.format(**log_data))
-            elif log_data['delta'] > debug_cutoff:
-                func_logger.debug(record_msg.format(**log_data))
-            return return_value
-
-        return _new_func
-
-    return log_excess_runtime_decorator
-
-
 def unified_job_class_to_event_table_name(job_class):
     return f'main_{job_class().event_class.__name__.lower()}'
+
+
+def load_all_entry_points_for(entry_point_subsections: list[str], /) -> dict[str, EntryPoint]:
+    return {ep.name: ep for entry_point_category in entry_point_subsections for ep in entry_points(group=f'awx_plugins.{entry_point_category}')}

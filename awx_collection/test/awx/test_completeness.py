@@ -21,7 +21,9 @@ read_only_endpoints_with_modules = ['settings', 'role', 'project_update', 'workf
 # If a module should not be created for an endpoint and the endpoint is not read-only add it here
 # THINK HARD ABOUT DOING THIS
 no_module_for_endpoint = [
+    'application',  # Usage of OAuth tokens is deprecated
     'constructed_inventory',  # This is a view for inventory with kind=constructed
+    'token',  # Usage of OAuth tokens is deprecated
 ]
 
 # Some modules work on the related fields of an endpoint. These modules will not have an auto-associated endpoint
@@ -50,18 +52,17 @@ no_endpoint_for_module = [
 extra_endpoints = {
     'bulk_job_launch': '/api/v2/bulk/job_launch/',
     'bulk_host_create': '/api/v2/bulk/host_create/',
+    'bulk_host_delete': '/api/v2/bulk/host_delete/',
 }
 
 # Global module parameters we can ignore
-ignore_parameters = ['state', 'new_name', 'update_secrets', 'copy_from']
+ignore_parameters = ['state', 'new_name', 'update_secrets', 'copy_from', 'is_internal']
 
 # Some modules take additional parameters that do not appear in the API
 # Add the module name as the key with the value being the list of params to ignore
 no_api_parameter_ok = {
     # The wait is for whether or not to wait for a project update on change
     'project': ['wait', 'interval', 'update_project'],
-    # Existing_token and id are for working with an existing tokens
-    'token': ['existing_token', 'existing_token_id'],
     # /survey spec is now how we handle associations
     # We take an organization here to help with the lookups only
     'job_template': ['survey_spec', 'organization'],
@@ -247,7 +248,7 @@ def test_completeness(collection_import, request, admin_user, job_template, exec
         singular_endpoint = '{0}'.format(endpoint)
         if singular_endpoint.endswith('ies'):
             singular_endpoint = singular_endpoint[:-3]
-        if singular_endpoint != 'settings' and singular_endpoint.endswith('s'):
+        elif singular_endpoint != 'settings' and singular_endpoint.endswith('s'):
             singular_endpoint = singular_endpoint[:-1]
         module_name = '{0}'.format(singular_endpoint)
 

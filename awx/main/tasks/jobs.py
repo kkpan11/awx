@@ -18,6 +18,9 @@ import urllib.parse as urlparse
 # Django
 from django.conf import settings
 
+# Shared code for the AWX platform
+from awx_plugins.interfaces._temporary_private_container_api import CONTAINER_ROOT, get_incontainer_path
+
 
 # Runner
 import ansible_runner
@@ -67,13 +70,14 @@ from awx.main.tasks.receptor import AWXReceptorJob
 from awx.main.tasks.facts import start_fact_cache, finish_fact_cache
 from awx.main.exceptions import AwxTaskError, PostRunError, ReceptorNodeNotFound
 from awx.main.utils.ansible import read_ansible_config
-from awx.main.utils.execution_environments import CONTAINER_ROOT, to_container_path
 from awx.main.utils.safe_yaml import safe_dump, sanitize_jinja
 from awx.main.utils.common import (
     update_scm_url,
     extract_ansible_vars,
     get_awx_version,
     create_partition,
+    ScheduleWorkflowManager,
+    ScheduleTaskManager,
 )
 from awx.conf.license import get_license
 from awx.main.utils.handlers import SpecialInventoryHandler
@@ -112,7 +116,7 @@ class BaseTask(object):
 
     def __init__(self):
         self.cleanup_paths = []
-        self.update_attempts = int(settings.DISPATCHER_DB_DOWNTOWN_TOLLERANCE / 5)
+        self.update_attempts = int(getattr(settings, 'DISPATCHER_DB_DOWNTOWN_TOLLERANCE', settings.DISPATCHER_DB_DOWNTIME_TOLERANCE) / 5)
         self.runner_callback = self.callback_class(model=self.model)
 
     def update_model(self, pk, _attempt=0, **updates):
@@ -297,7 +301,7 @@ class BaseTask(object):
         env = {}
         # Add ANSIBLE_* settings to the subprocess environment.
         for attr in dir(settings):
-            if attr == attr.upper() and attr.startswith('ANSIBLE_'):
+            if attr == attr.upper() and attr.startswith('ANSIBLE_') and not attr.startswith('ANSIBLE_BASE_'):
                 env[attr] = str(getattr(settings, attr))
         # Also set environment variables configured in AWX_TASK_ENV setting.
         for key, value in settings.AWX_TASK_ENV.items():
@@ -449,6 +453,12 @@ class BaseTask(object):
                 ansible_version_info = ee_ansible_info.readline()
                 instance.ansible_version = ansible_version_info
                 instance.save(update_fields=['ansible_version'])
+
+        # Run task manager appropriately for speculative dependencies
+        if instance.unifiedjob_blocked_jobs.exists():
+            ScheduleTaskManager().schedule()
+        if instance.spawned_by_workflow:
+            ScheduleWorkflowManager().schedule()
 
     def should_use_fact_cache(self):
         return False
@@ -690,6 +700,7 @@ class SourceControlMixin(BaseTask):
             logger.debug(f'Project not available locally, {self.instance.id} will sync with remote')
             sync_needs.append(source_update_tag)
 
+        # Determine whether or not this project sync needs to populate the cache for Ansible content, roles and collections
         has_cache = os.path.exists(os.path.join(project.get_cache_path(), project.cache_id))
         # Galaxy requirements are not supported for manual projects
         if project.scm_type and ((not has_cache) or branch_override):
@@ -901,7 +912,7 @@ class RunJob(SourceControlMixin, BaseTask):
         cred_files = private_data_files.get('credentials', {})
         for cloud_cred in job.cloud_credentials:
             if cloud_cred and cloud_cred.credential_type.namespace == 'openstack' and cred_files.get(cloud_cred, ''):
-                env['OS_CLIENT_CONFIG_FILE'] = to_container_path(cred_files.get(cloud_cred, ''), private_data_dir)
+                env['OS_CLIENT_CONFIG_FILE'] = get_incontainer_path(cred_files.get(cloud_cred, ''), private_data_dir)
 
         for network_cred in job.network_credentials:
             env['ANSIBLE_NET_USERNAME'] = network_cred.get_input('username', default='')
@@ -1094,7 +1105,7 @@ class RunJob(SourceControlMixin, BaseTask):
             # actual `run()` call; this _usually_ means something failed in
             # the pre_run_hook method
             return
-        if self.should_use_fact_cache():
+        if self.should_use_fact_cache() and self.runner_callback.artifacts_processed:
             job.log_lifecycle("finish_job_fact_cache")
             finish_fact_cache(
                 job.get_hosts_for_fact_cache(),
@@ -1270,6 +1281,7 @@ class RunProjectUpdate(BaseTask):
                 'local_path': os.path.basename(project_update.project.local_path),
                 'project_path': project_update.get_project_path(check_if_exists=False),  # deprecated
                 'insights_url': settings.INSIGHTS_URL_BASE,
+                'oidc_endpoint': settings.INSIGHTS_OIDC_ENDPOINT,
                 'awx_license_type': get_license().get('license_type', 'UNLICENSED'),
                 'awx_version': get_awx_version(),
                 'scm_url': scm_url,
@@ -1436,6 +1448,11 @@ class RunProjectUpdate(BaseTask):
         )
         return params
 
+    def build_credentials_list(self, project_update):
+        if project_update.scm_type == 'insights' and project_update.credential:
+            return [project_update.credential]
+        return []
+
 
 @task(queue=get_task_queuename)
 class RunInventoryUpdate(SourceControlMixin, BaseTask):
@@ -1544,7 +1561,7 @@ class RunInventoryUpdate(SourceControlMixin, BaseTask):
                 args.append('-i')
                 script_params = dict(hostvars=True, towervars=True)
                 source_inv_path = self.write_inventory_file(input_inventory, private_data_dir, f'hosts_{input_inventory.id}', script_params)
-                args.append(to_container_path(source_inv_path, private_data_dir))
+                args.append(get_incontainer_path(source_inv_path, private_data_dir))
                 # Include any facts from input inventories so they can be used in filters
                 start_fact_cache(
                     input_inventory.hosts.only(*HOST_FACTS_FIELDS),
@@ -1873,6 +1890,8 @@ class RunSystemJob(BaseTask):
             if system_job.job_type in ('cleanup_jobs', 'cleanup_activitystream'):
                 if 'days' in json_vars:
                     args.extend(['--days', str(json_vars.get('days', 60))])
+                if 'batch_size' in json_vars:
+                    args.extend(['--batch-size', str(json_vars['batch_size'])])
                 if 'dry_run' in json_vars and json_vars['dry_run']:
                     args.extend(['--dry-run'])
             if system_job.job_type == 'cleanup_jobs':

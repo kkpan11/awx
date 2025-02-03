@@ -9,8 +9,7 @@ import tempfile
 import socket
 from datetime import timedelta
 
-# python-ldap
-import ldap
+from split_settings.tools import include
 
 
 DEBUG = True
@@ -36,6 +35,18 @@ DATABASES = {
     }
 }
 
+# Special database overrides for dispatcher connections listening to pg_notify
+LISTENER_DATABASES = {
+    'default': {
+        'OPTIONS': {
+            'keepalives': 1,
+            'keepalives_idle': 5,
+            'keepalives_interval': 5,
+            'keepalives_count': 5,
+        },
+    }
+}
+
 # Whether or not the deployment is a K8S-based deployment
 # In K8S-based deployments, instances have zero capacity - all playbook
 # automation is intended to flow through defined Container Groups that
@@ -45,6 +56,7 @@ IS_K8S = False
 
 AWX_CONTAINER_GROUP_K8S_API_TIMEOUT = 10
 AWX_CONTAINER_GROUP_DEFAULT_NAMESPACE = os.getenv('MY_POD_NAMESPACE', 'default')
+AWX_CONTAINER_GROUP_DEFAULT_JOB_LABEL = os.getenv('AWX_CONTAINER_GROUP_DEFAULT_JOB_LABEL', 'ansible_job')
 # Timeout when waiting for pod to enter running state. If the pod is still in pending state , it will be terminated. Valid time units are "s", "m", "h". Example : "5m" , "10s".
 AWX_CONTAINER_GROUP_POD_PENDING_TIMEOUT = "2h"
 
@@ -78,8 +90,7 @@ USE_L10N = True
 USE_TZ = True
 
 STATICFILES_DIRS = [
-    os.path.join(BASE_DIR, 'ui', 'build', 'static'),
-    os.path.join(BASE_DIR, 'ui_next', 'build'),
+    os.path.join(BASE_DIR, 'ui', 'build'),
     os.path.join(BASE_DIR, 'static'),
 ]
 
@@ -101,6 +112,7 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'public', 'media')
 MEDIA_URL = '/media/'
 
 LOGIN_URL = '/api/login/'
+LOGOUT_ALLOWED_HOSTS = None
 
 # Absolute filesystem path to the directory to host projects (with playbooks).
 # This directory should not be web-accessible.
@@ -130,6 +142,9 @@ BULK_JOB_MAX_LAUNCH = 100
 
 # Maximum number of host that can be created in 1 bulk host create
 BULK_HOST_MAX_CREATE = 100
+
+# Maximum number of host that can be deleted in 1 bulk host delete
+BULK_HOST_MAX_DELETE = 250
 
 SITE_ID = 1
 
@@ -210,7 +225,7 @@ JOB_EVENT_WORKERS = 4
 
 # The number of seconds to buffer callback receiver bulk
 # writes in memory before flushing via JobEvent.objects.bulk_create()
-JOB_EVENT_BUFFER_SECONDS = 0.1
+JOB_EVENT_BUFFER_SECONDS = 1
 
 # The interval at which callback receiver statistics should be
 # recorded
@@ -245,6 +260,7 @@ START_TASK_LIMIT = 100
 # We have the grace period so the task manager can bail out before the timeout.
 TASK_MANAGER_TIMEOUT = 300
 TASK_MANAGER_TIMEOUT_GRACE_PERIOD = 60
+TASK_MANAGER_LOCK_TIMEOUT = TASK_MANAGER_TIMEOUT + TASK_MANAGER_TIMEOUT_GRACE_PERIOD
 
 # Number of seconds _in addition to_ the task manager timeout a job can stay
 # in waiting without being reaped
@@ -260,6 +276,9 @@ SESSION_COOKIE_SECURE = True
 # Seconds before sessions expire.
 # Note: This setting may be overridden by database settings.
 SESSION_COOKIE_AGE = 1800
+
+# Option to change userLoggedIn cookie SameSite policy.
+USER_COOKIE_SAMESITE = 'Lax'
 
 # Name of the cookie that contains the session information.
 # Note: Changing this value may require changes to any clients.
@@ -293,18 +312,20 @@ TEMPLATES = [
                 'django.template.context_processors.static',
                 'django.template.context_processors.tz',
                 'django.contrib.messages.context_processors.messages',
+                'django.template.context_processors.request',
                 'awx.ui.context_processors.csp',
                 'awx.ui.context_processors.version',
-                'social_django.context_processors.backends',
-                'social_django.context_processors.login_redirect',
             ],
             'builtins': ['awx.main.templatetags.swagger'],
+            'libraries': {
+                "ansible_base.lib.templatetags.requests": "ansible_base.lib.templatetags.requests",
+                "ansible_base.lib.templatetags.util": "ansible_base.lib.templatetags.util",
+            },
         },
         'DIRS': [
             os.path.join(BASE_DIR, 'templates'),
-            os.path.join(BASE_DIR, 'ui', 'build'),
             os.path.join(BASE_DIR, 'ui', 'public'),
-            os.path.join(BASE_DIR, 'ui_next', 'build', 'awx'),
+            os.path.join(BASE_DIR, 'ui', 'build', 'awx'),
         ],
     },
 ]
@@ -323,20 +344,24 @@ INSTALLED_APPS = [
     # According to channels 4.0 docs you install daphne instead of channels now
     'daphne',
     'django.contrib.staticfiles',
-    'oauth2_provider',
     'rest_framework',
     'django_extensions',
     'polymorphic',
-    'social_django',
     'django_guid',
     'corsheaders',
     'awx.conf',
     'awx.main',
     'awx.api',
     'awx.ui',
-    'awx.sso',
     'solo',
+    'ansible_base.rest_filters',
+    'ansible_base.jwt_consumer',
+    'ansible_base.resource_registry',
+    'ansible_base.rbac',
+    'ansible_base.feature_flags',
+    'flags',
 ]
+
 
 INTERNAL_IPS = ('127.0.0.1',)
 
@@ -345,17 +370,11 @@ REST_FRAMEWORK = {
     'DEFAULT_PAGINATION_CLASS': 'awx.api.pagination.Pagination',
     'PAGE_SIZE': 25,
     'DEFAULT_AUTHENTICATION_CLASSES': (
-        'awx.api.authentication.LoggedOAuth2Authentication',
+        'ansible_base.jwt_consumer.awx.auth.AwxJWTAuthentication',
         'awx.api.authentication.SessionAuthentication',
         'awx.api.authentication.LoggedBasicAuthentication',
     ),
     'DEFAULT_PERMISSION_CLASSES': ('awx.api.permissions.ModelAccessPermission',),
-    'DEFAULT_FILTER_BACKENDS': (
-        'awx.api.filters.TypeFilterBackend',
-        'awx.api.filters.FieldLookupBackend',
-        'rest_framework.filters.SearchFilter',
-        'awx.api.filters.OrderByBackend',
-    ),
     'DEFAULT_PARSER_CLASSES': ('awx.api.parsers.JSONParser',),
     'DEFAULT_RENDERER_CLASSES': ('awx.api.renderers.DefaultJSONRenderer', 'awx.api.renderers.BrowsableAPIRenderer'),
     'DEFAULT_METADATA_CLASS': 'awx.api.metadata.Metadata',
@@ -369,61 +388,11 @@ REST_FRAMEWORK = {
     # 'URL_FORMAT_OVERRIDE': None,
 }
 
-AUTHENTICATION_BACKENDS = (
-    'awx.sso.backends.LDAPBackend',
-    'awx.sso.backends.LDAPBackend1',
-    'awx.sso.backends.LDAPBackend2',
-    'awx.sso.backends.LDAPBackend3',
-    'awx.sso.backends.LDAPBackend4',
-    'awx.sso.backends.LDAPBackend5',
-    'awx.sso.backends.RADIUSBackend',
-    'awx.sso.backends.TACACSPlusBackend',
-    'social_core.backends.google.GoogleOAuth2',
-    'social_core.backends.github.GithubOAuth2',
-    'social_core.backends.github.GithubOrganizationOAuth2',
-    'social_core.backends.github.GithubTeamOAuth2',
-    'social_core.backends.github_enterprise.GithubEnterpriseOAuth2',
-    'social_core.backends.github_enterprise.GithubEnterpriseOrganizationOAuth2',
-    'social_core.backends.github_enterprise.GithubEnterpriseTeamOAuth2',
-    'social_core.backends.open_id_connect.OpenIdConnectAuth',
-    'social_core.backends.azuread.AzureADOAuth2',
-    'awx.sso.backends.SAMLAuth',
-    'awx.main.backends.AWXModelBackend',
-)
+SWAGGER_SETTINGS = {
+    'DEFAULT_AUTO_SCHEMA_CLASS': 'awx.api.swagger.CustomSwaggerAutoSchema',
+}
 
-
-# Django OAuth Toolkit settings
-OAUTH2_PROVIDER_APPLICATION_MODEL = 'main.OAuth2Application'
-OAUTH2_PROVIDER_ACCESS_TOKEN_MODEL = 'main.OAuth2AccessToken'
-OAUTH2_PROVIDER_REFRESH_TOKEN_MODEL = 'oauth2_provider.RefreshToken'
-OAUTH2_PROVIDER_ID_TOKEN_MODEL = "oauth2_provider.IDToken"
-
-OAUTH2_PROVIDER = {'ACCESS_TOKEN_EXPIRE_SECONDS': 31536000000, 'AUTHORIZATION_CODE_EXPIRE_SECONDS': 600, 'REFRESH_TOKEN_EXPIRE_SECONDS': 2628000}
-ALLOW_OAUTH2_FOR_EXTERNAL_USERS = False
-
-# LDAP server (default to None to skip using LDAP authentication).
-# Note: This setting may be overridden by database settings.
-AUTH_LDAP_SERVER_URI = None
-
-# Disable LDAP referrals by default (to prevent certain LDAP queries from
-# hanging with AD).
-# Note: This setting may be overridden by database settings.
-AUTH_LDAP_CONNECTION_OPTIONS = {ldap.OPT_REFERRALS: 0, ldap.OPT_NETWORK_TIMEOUT: 30}
-
-# Radius server settings (default to empty string to skip using Radius auth).
-# Note: These settings may be overridden by database settings.
-RADIUS_SERVER = ''
-RADIUS_PORT = 1812
-RADIUS_SECRET = ''
-
-# TACACS+ settings (default host to empty string to skip using TACACS+ auth).
-# Note: These settings may be overridden by database settings.
-TACACSPLUS_HOST = ''
-TACACSPLUS_PORT = 49
-TACACSPLUS_SECRET = ''
-TACACSPLUS_SESSION_TIMEOUT = 5
-TACACSPLUS_AUTH_PROTOCOL = 'ascii'
-TACACSPLUS_REM_ADDR = False
+AUTHENTICATION_BACKENDS = ('awx.main.backends.AWXModelBackend',)
 
 # Enable / Disable HTTP Basic Authentication used in the API browser
 # Note: Session limits are not enforced when using HTTP Basic Authentication.
@@ -453,7 +422,7 @@ RECEPTOR_SERVICE_ADVERTISEMENT_PERIOD = 60  # https://github.com/ansible/recepto
 EXECUTION_NODE_REMEDIATION_CHECKS = 60 * 30  # once every 30 minutes check if an execution node errors have been resolved
 
 # Amount of time dispatcher will try to reconnect to database for jobs and consuming new work
-DISPATCHER_DB_DOWNTOWN_TOLLERANCE = 40
+DISPATCHER_DB_DOWNTIME_TOLERANCE = 40
 
 BROKER_URL = 'unix:///var/run/redis/redis.sock'
 CELERYBEAT_SCHEDULE = {
@@ -470,98 +439,21 @@ CELERYBEAT_SCHEDULE = {
     'receptor_reaper': {'task': 'awx.main.tasks.system.awx_receptor_workunit_reaper', 'schedule': timedelta(seconds=60)},
     'send_subsystem_metrics': {'task': 'awx.main.analytics.analytics_tasks.send_subsystem_metrics', 'schedule': timedelta(seconds=20)},
     'cleanup_images': {'task': 'awx.main.tasks.system.cleanup_images_and_files', 'schedule': timedelta(hours=3)},
-    'cleanup_host_metrics': {'task': 'awx.main.tasks.system.cleanup_host_metrics', 'schedule': timedelta(hours=3, minutes=30)},
+    'cleanup_host_metrics': {'task': 'awx.main.tasks.host_metrics.cleanup_host_metrics', 'schedule': timedelta(hours=3, minutes=30)},
     'host_metric_summary_monthly': {'task': 'awx.main.tasks.host_metrics.host_metric_summary_monthly', 'schedule': timedelta(hours=4)},
+    'periodic_resource_sync': {'task': 'awx.main.tasks.system.periodic_resource_sync', 'schedule': timedelta(minutes=15)},
 }
 
 # Django Caching Configuration
 DJANGO_REDIS_IGNORE_EXCEPTIONS = True
-CACHES = {'default': {'BACKEND': 'awx.main.cache.AWXRedisCache', 'LOCATION': 'unix:/var/run/redis/redis.sock?db=1'}}
+CACHES = {'default': {'BACKEND': 'awx.main.cache.AWXRedisCache', 'LOCATION': 'unix:///var/run/redis/redis.sock?db=1'}}
 
-# Social Auth configuration.
-SOCIAL_AUTH_STRATEGY = 'social_django.strategy.DjangoStrategy'
-SOCIAL_AUTH_STORAGE = 'social_django.models.DjangoStorage'
-SOCIAL_AUTH_USER_MODEL = 'auth.User'
+ROLE_SINGLETON_USER_RELATIONSHIP = ''
+ROLE_SINGLETON_TEAM_RELATIONSHIP = ''
 
-_SOCIAL_AUTH_PIPELINE_BASE = (
-    'social_core.pipeline.social_auth.social_details',
-    'social_core.pipeline.social_auth.social_uid',
-    'social_core.pipeline.social_auth.auth_allowed',
-    'social_core.pipeline.social_auth.social_user',
-    'social_core.pipeline.user.get_username',
-    'social_core.pipeline.social_auth.associate_by_email',
-    'social_core.pipeline.user.create_user',
-    'awx.sso.social_base_pipeline.check_user_found_or_created',
-    'social_core.pipeline.social_auth.associate_user',
-    'social_core.pipeline.social_auth.load_extra_data',
-    'awx.sso.social_base_pipeline.set_is_active_for_new_user',
-    'social_core.pipeline.user.user_details',
-    'awx.sso.social_base_pipeline.prevent_inactive_login',
-)
-SOCIAL_AUTH_PIPELINE = _SOCIAL_AUTH_PIPELINE_BASE + ('awx.sso.social_pipeline.update_user_orgs', 'awx.sso.social_pipeline.update_user_teams')
-SOCIAL_AUTH_SAML_PIPELINE = _SOCIAL_AUTH_PIPELINE_BASE + ('awx.sso.saml_pipeline.populate_user', 'awx.sso.saml_pipeline.update_user_flags')
-SAML_AUTO_CREATE_OBJECTS = True
-
-SOCIAL_AUTH_LOGIN_URL = '/'
-SOCIAL_AUTH_LOGIN_REDIRECT_URL = '/sso/complete/'
-SOCIAL_AUTH_LOGIN_ERROR_URL = '/sso/error/'
-SOCIAL_AUTH_INACTIVE_USER_URL = '/sso/inactive/'
-
-SOCIAL_AUTH_RAISE_EXCEPTIONS = False
-SOCIAL_AUTH_USERNAME_IS_FULL_EMAIL = False
-# SOCIAL_AUTH_SLUGIFY_USERNAMES = True
-SOCIAL_AUTH_CLEAN_USERNAMES = True
-
-SOCIAL_AUTH_SANITIZE_REDIRECTS = True
-SOCIAL_AUTH_REDIRECT_IS_HTTPS = False
-
-# Note: These settings may be overridden by database settings.
-SOCIAL_AUTH_GOOGLE_OAUTH2_KEY = ''
-SOCIAL_AUTH_GOOGLE_OAUTH2_SECRET = ''
-SOCIAL_AUTH_GOOGLE_OAUTH2_SCOPE = ['profile']
-
-SOCIAL_AUTH_GITHUB_KEY = ''
-SOCIAL_AUTH_GITHUB_SECRET = ''
-SOCIAL_AUTH_GITHUB_SCOPE = ['user:email', 'read:org']
-
-SOCIAL_AUTH_GITHUB_ORG_KEY = ''
-SOCIAL_AUTH_GITHUB_ORG_SECRET = ''
-SOCIAL_AUTH_GITHUB_ORG_NAME = ''
-SOCIAL_AUTH_GITHUB_ORG_SCOPE = ['user:email', 'read:org']
-
-SOCIAL_AUTH_GITHUB_TEAM_KEY = ''
-SOCIAL_AUTH_GITHUB_TEAM_SECRET = ''
-SOCIAL_AUTH_GITHUB_TEAM_ID = ''
-SOCIAL_AUTH_GITHUB_TEAM_SCOPE = ['user:email', 'read:org']
-
-SOCIAL_AUTH_GITHUB_ENTERPRISE_KEY = ''
-SOCIAL_AUTH_GITHUB_ENTERPRISE_SECRET = ''
-SOCIAL_AUTH_GITHUB_ENTERPRISE_SCOPE = ['user:email', 'read:org']
-
-SOCIAL_AUTH_GITHUB_ENTERPRISE_ORG_KEY = ''
-SOCIAL_AUTH_GITHUB_ENTERPRISE_ORG_SECRET = ''
-SOCIAL_AUTH_GITHUB_ENTERPRISE_ORG_NAME = ''
-SOCIAL_AUTH_GITHUB_ENTERPRISE_ORG_SCOPE = ['user:email', 'read:org']
-
-SOCIAL_AUTH_GITHUB_ENTERPRISE_TEAM_KEY = ''
-SOCIAL_AUTH_GITHUB_ENTERPRISE_TEAM_SECRET = ''
-SOCIAL_AUTH_GITHUB_ENTERPRISE_TEAM_ID = ''
-SOCIAL_AUTH_GITHUB_ENTERPRISE_TEAM_SCOPE = ['user:email', 'read:org']
-
-SOCIAL_AUTH_AZUREAD_OAUTH2_KEY = ''
-SOCIAL_AUTH_AZUREAD_OAUTH2_SECRET = ''
-
-SOCIAL_AUTH_SAML_SP_ENTITY_ID = ''
-SOCIAL_AUTH_SAML_SP_PUBLIC_CERT = ''
-SOCIAL_AUTH_SAML_SP_PRIVATE_KEY = ''
-SOCIAL_AUTH_SAML_ORG_INFO = {}
-SOCIAL_AUTH_SAML_TECHNICAL_CONTACT = {}
-SOCIAL_AUTH_SAML_SUPPORT_CONTACT = {}
-SOCIAL_AUTH_SAML_ENABLED_IDPS = {}
-
-SOCIAL_AUTH_SAML_ORGANIZATION_ATTR = {}
-SOCIAL_AUTH_SAML_TEAM_ATTR = {}
-SOCIAL_AUTH_SAML_USER_FLAGS_BY_ATTR = {}
+# We want to short-circuit RBAC methods to get permission to system admins and auditors
+ROLE_BYPASS_SUPERUSER_FLAGS = ['is_superuser']
+ROLE_BYPASS_ACTION_FLAGS = {'view': 'is_system_auditor'}
 
 # Any ANSIBLE_* settings will be passed to the task runner subprocess
 # environment
@@ -629,6 +521,13 @@ AWX_ANSIBLE_CALLBACK_PLUGINS = ""
 
 # Automatically remove nodes that have missed their heartbeats after some time
 AWX_AUTO_DEPROVISION_INSTANCES = False
+
+# If False, do not allow creation of resources that are shared with the platform ingress
+# e.g. organizations, teams, and users
+ALLOW_LOCAL_RESOURCE_MANAGEMENT = True
+
+# If True, allow users to be assigned to roles that were created via JWT
+ALLOW_LOCAL_ASSIGNING_JWT_ROLES = False
 
 # Enable Pendo on the UI, possible values are 'off', 'anonymous', and 'detailed'
 # Note: This setting may be overridden by database settings.
@@ -744,6 +643,19 @@ SATELLITE6_INSTANCE_ID_VAR = 'foreman_id,foreman.id'
 INSIGHTS_INSTANCE_ID_VAR = 'insights_id'
 INSIGHTS_EXCLUDE_EMPTY_GROUPS = False
 
+# ----------------
+# -- Terraform State --
+# ----------------
+# TERRAFORM_ENABLED_VAR =
+# TERRAFORM_ENABLED_VALUE =
+TERRAFORM_INSTANCE_ID_VAR = 'id'
+TERRAFORM_EXCLUDE_EMPTY_GROUPS = True
+
+# ------------------------
+# OpenShift Virtualization
+# ------------------------
+OPENSHIFT_VIRTUALIZATION_EXCLUDE_EMPTY_GROUPS = True
+
 # ---------------------
 # ----- Custom -----
 # ---------------------
@@ -783,9 +695,10 @@ MANAGE_ORGANIZATION_AUTH = True
 DISABLE_LOCAL_AUTH = False
 
 # Note: This setting may be overridden by database settings.
-TOWER_URL_BASE = "https://towerhost"
+TOWER_URL_BASE = "https://platformhost"
 
 INSIGHTS_URL_BASE = "https://example.org"
+INSIGHTS_OIDC_ENDPOINT = "https://sso.example.org"
 INSIGHTS_AGENT_MIME = 'application/example'
 # See https://github.com/ansible/awx-facts-playbooks
 INSIGHTS_SYSTEM_ID_FILE = '/etc/redhat-access-insights/machine-id'
@@ -796,7 +709,7 @@ LOG_AGGREGATOR_ENABLED = False
 LOG_AGGREGATOR_TCP_TIMEOUT = 5
 LOG_AGGREGATOR_VERIFY_CERT = True
 LOG_AGGREGATOR_LEVEL = 'INFO'
-LOG_AGGREGATOR_MAX_DISK_USAGE_GB = 1  # Main queue
+LOG_AGGREGATOR_ACTION_QUEUE_SIZE = 131072
 LOG_AGGREGATOR_ACTION_MAX_DISK_USAGE_GB = 1  # Action queue
 LOG_AGGREGATOR_MAX_DISK_USAGE_PATH = '/var/lib/awx'
 LOG_AGGREGATOR_RSYSLOGD_DEBUG = False
@@ -826,7 +739,6 @@ LOGGING = {
         'json': {'()': 'awx.main.utils.formatters.LogstashFormatter'},
         'timed_import': {'()': 'awx.main.utils.formatters.TimeFormatter', 'format': '%(relativeSeconds)9.3f %(levelname)-8s %(message)s'},
         'dispatcher': {'format': '%(asctime)s %(levelname)-8s [%(guid)s] %(name)s PID:%(process)d %(message)s'},
-        'job_lifecycle': {'()': 'awx.main.utils.formatters.JobLifeCycleFormatter'},
     },
     # Extended below based on install scenario. You probably don't want to add something directly here.
     # See 'handler_config' below.
@@ -847,10 +759,12 @@ LOGGING = {
             'address': '/var/run/awx-rsyslog/rsyslog.sock',
             'filters': ['external_log_enabled', 'dynamic_level_filter', 'guid'],
         },
+        'otel': {'class': 'logging.NullHandler'},
     },
     'loggers': {
         'django': {'handlers': ['console']},
         'django.request': {'handlers': ['console', 'file', 'tower_warnings'], 'level': 'WARNING'},
+        'ansible_base': {'handlers': ['console', 'file', 'tower_warnings']},
         'daphne': {'handlers': ['console', 'file', 'tower_warnings'], 'level': 'INFO'},
         'rest_framework.request': {'handlers': ['console', 'file', 'tower_warnings'], 'level': 'WARNING', 'propagate': False},
         'py.warnings': {'handlers': ['console']},
@@ -875,8 +789,7 @@ LOGGING = {
         'awx.analytics': {'handlers': ['external_logger'], 'level': 'INFO', 'propagate': False},
         'awx.analytics.broadcast_websocket': {'handlers': ['console', 'file', 'wsrelay', 'external_logger'], 'level': 'INFO', 'propagate': False},
         'awx.analytics.performance': {'handlers': ['console', 'file', 'tower_warnings', 'external_logger'], 'level': 'DEBUG', 'propagate': False},
-        'awx.analytics.job_lifecycle': {'handlers': ['console', 'job_lifecycle'], 'level': 'DEBUG', 'propagate': False},
-        'django_auth_ldap': {'handlers': ['console', 'file', 'tower_warnings'], 'level': 'DEBUG'},
+        'awx.analytics.job_lifecycle': {'handlers': ['console', 'job_lifecycle', 'external_logger'], 'level': 'DEBUG', 'propagate': False},
         'social': {'handlers': ['console', 'file', 'tower_warnings'], 'level': 'DEBUG'},
         'system_tracking_migrations': {'handlers': ['console', 'file', 'tower_warnings'], 'level': 'DEBUG'},
         'rbac_migrations': {'handlers': ['console', 'file', 'tower_warnings'], 'level': 'DEBUG'},
@@ -894,7 +807,7 @@ handler_config = {
     'wsrelay': {'filename': 'wsrelay.log'},
     'task_system': {'filename': 'task_system.log'},
     'rbac_migrations': {'filename': 'tower_rbac_migrations.log'},
-    'job_lifecycle': {'filename': 'job_lifecycle.log', 'formatter': 'job_lifecycle'},
+    'job_lifecycle': {'filename': 'job_lifecycle.log'},
     'rsyslog_configurer': {'filename': 'rsyslog_configurer.log'},
     'cache_clear': {'filename': 'cache_clear.log'},
     'ws_heartbeat': {'filename': 'ws_heartbeat.log'},
@@ -963,12 +876,14 @@ AWX_RUNNER_KEEPALIVE_SECONDS = 0
 
 # Delete completed work units in receptor
 RECEPTOR_RELEASE_WORK = True
+RECEPTOR_KEEP_WORK_ON_ERROR = False
 
 # K8S only. Use receptor_log_level on AWX spec to set this properly
 RECEPTOR_LOG_LEVEL = 'info'
 
 MIDDLEWARE = [
     'django_guid.middleware.guid_middleware',
+    'ansible_base.lib.middleware.logging.log_request.LogTracebackMiddleware',
     'awx.main.middleware.SettingsCacheMiddleware',
     'awx.main.middleware.TimingMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
@@ -980,7 +895,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'awx.main.middleware.DisableLocalAuthMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
-    'awx.sso.middleware.SocialAuthMiddleware',
+    'awx.main.middleware.OptionalURLPrefixPath',
     'crum.CurrentRequestUserMiddleware',
     'awx.main.middleware.URLModificationMiddleware',
     'awx.main.middleware.SessionTimeoutMiddleware',
@@ -1042,14 +957,12 @@ AWX_MOUNT_ISOLATED_PATHS_ON_K8S = False
 # This is overridden downstream via /etc/tower/conf.d/cluster_host_id.py
 CLUSTER_HOST_ID = socket.gethostname()
 
-UI_NEXT = True
-
 # License compliance for total host count. Possible values:
 # - '': No model - Subscription not counted from Host Metrics
 # - 'unique_managed_hosts': Compliant = automated - deleted hosts (using /api/v2/host_metrics/)
 SUBSCRIPTION_USAGE_MODEL = ''
 
-# Host metrics cleanup - last time of the cleanup run (soft-deleting records)
+# Host metrics cleanup - last time of the task/command run
 CLEANUP_HOST_METRICS_LAST_TS = None
 # Host metrics cleanup - minimal interval between two cleanups in days
 CLEANUP_HOST_METRICS_INTERVAL = 30  # days
@@ -1063,3 +976,90 @@ CLEANUP_HOST_METRICS_HARD_THRESHOLD = 36  # months
 # Host metric summary monthly task - last time of run
 HOST_METRIC_SUMMARY_TASK_LAST_TS = None
 HOST_METRIC_SUMMARY_TASK_INTERVAL = 7  # days
+
+
+# TODO: cmeyers, replace with with register pattern
+# The register pattern is particularly nice for this because we need
+# to know the process to start the thread that will be the server.
+# The registration location should be the same location as we would
+# call MetricsServer.start()
+# Note: if we don't get to this TODO, then at least create constants
+# for the services strings below.
+# TODO: cmeyers, break this out into a separate django app so other
+# projects can take advantage.
+
+METRICS_SERVICE_CALLBACK_RECEIVER = 'callback_receiver'
+METRICS_SERVICE_DISPATCHER = 'dispatcher'
+METRICS_SERVICE_WEBSOCKETS = 'websockets'
+
+METRICS_SUBSYSTEM_CONFIG = {
+    'server': {
+        METRICS_SERVICE_CALLBACK_RECEIVER: {
+            'port': 8014,
+        },
+        METRICS_SERVICE_DISPATCHER: {
+            'port': 8015,
+        },
+        METRICS_SERVICE_WEBSOCKETS: {
+            'port': 8016,
+        },
+    }
+}
+
+
+# django-ansible-base
+ANSIBLE_BASE_TEAM_MODEL = 'main.Team'
+ANSIBLE_BASE_ORGANIZATION_MODEL = 'main.Organization'
+ANSIBLE_BASE_RESOURCE_CONFIG_MODULE = 'awx.resource_api'
+ANSIBLE_BASE_PERMISSION_MODEL = 'main.Permission'
+
+from ansible_base.lib import dynamic_config  # noqa: E402
+
+include(os.path.join(os.path.dirname(dynamic_config.__file__), 'dynamic_settings.py'))
+
+# Add a postfix to the API URL patterns
+# example if set to '' API pattern will be /api
+# example if set to 'controller' API pattern will be /api AND /api/controller
+OPTIONAL_API_URLPATTERN_PREFIX = ''
+
+# Add a postfix to the UI URL patterns for UI URL generated by the API
+# example if set to '' UI URL generated by the API for jobs would be $TOWER_URL/jobs
+# example if set to 'execution' UI URL generated by the API for jobs would be $TOWER_URL/execution/jobs
+OPTIONAL_UI_URL_PREFIX = ''
+
+# Use AWX base view, to give 401 on unauthenticated requests
+ANSIBLE_BASE_CUSTOM_VIEW_PARENT = 'awx.api.generics.APIView'
+
+# If we have a resource server defined, apply local changes to that server
+RESOURCE_SERVER_SYNC_ENABLED = True
+
+# Settings for the ansible_base RBAC system
+
+# This has been moved to data migration code
+ANSIBLE_BASE_ROLE_PRECREATE = {}
+
+# Name for auto-created roles that give users permissions to what they create
+ANSIBLE_BASE_ROLE_CREATOR_NAME = '{cls.__name__} Creator'
+
+# Use the new Gateway RBAC system for evaluations? You should. We will remove the old system soon.
+ANSIBLE_BASE_ROLE_SYSTEM_ACTIVATED = True
+
+# Permissions a user will get when creating a new item
+ANSIBLE_BASE_CREATOR_DEFAULTS = ['change', 'delete', 'execute', 'use', 'adhoc', 'approve', 'update', 'view']
+
+# Temporary, for old roles API compatibility, save child permissions at organization level
+ANSIBLE_BASE_CACHE_PARENT_PERMISSIONS = True
+
+# Currently features are enabled to keep compatibility with old system, except custom roles
+ANSIBLE_BASE_ALLOW_TEAM_ORG_ADMIN = False
+# ANSIBLE_BASE_ALLOW_CUSTOM_ROLES = True
+ANSIBLE_BASE_ALLOW_CUSTOM_TEAM_ROLES = False
+ANSIBLE_BASE_ALLOW_SINGLETON_USER_ROLES = True
+ANSIBLE_BASE_ALLOW_SINGLETON_TEAM_ROLES = False  # System auditor has always been restricted to users
+ANSIBLE_BASE_ALLOW_SINGLETON_ROLES_API = False  # Do not allow creating user-defined system-wide roles
+
+# system username for django-ansible-base
+SYSTEM_USERNAME = None
+
+# feature flags
+FLAGS = {'FEATURE_INDIRECT_NODE_COUNTING_ENABLED': [{'condition': 'boolean', 'value': False}]}

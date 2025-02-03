@@ -6,13 +6,9 @@ import copy
 import json
 import logging
 import re
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from datetime import timedelta
 from uuid import uuid4
-
-# OAuth2
-from oauthlib import oauth2
-from oauthlib.common import generate_token
 
 # Jinja
 from jinja2 import sandbox, StrictUndefined
@@ -43,9 +39,14 @@ from rest_framework.utils.serializer_helpers import ReturnList
 # Django-Polymorphic
 from polymorphic.models import PolymorphicModel
 
+# django-ansible-base
+from ansible_base.lib.utils.models import get_type_for_model
+from ansible_base.rbac.models import RoleEvaluation, ObjectRole
+from ansible_base.rbac import permission_registry
+
 # AWX
 from awx.main.access import get_user_capabilities
-from awx.main.constants import ACTIVE_STATES, CENSOR_VALUE
+from awx.main.constants import ACTIVE_STATES, org_role_to_permission
 from awx.main.models import (
     ActivityStream,
     AdHocCommand,
@@ -74,13 +75,11 @@ from awx.main.models import (
     Label,
     Notification,
     NotificationTemplate,
-    OAuth2AccessToken,
-    OAuth2Application,
     Organization,
     Project,
     ProjectUpdate,
     ProjectUpdateEvent,
-    RefreshToken,
+    ReceptorAddress,
     Role,
     Schedule,
     SystemJob,
@@ -96,13 +95,11 @@ from awx.main.models import (
     WorkflowJobTemplate,
     WorkflowJobTemplateNode,
     StdoutMaxBytesExceeded,
-    CLOUD_INVENTORY_SOURCES,
 )
 from awx.main.models.base import VERBOSITY_CHOICES, NEW_JOB_TYPE_CHOICES
-from awx.main.models.rbac import get_roles_on_resource, role_summary_fields_generator
+from awx.main.models.rbac import role_summary_fields_generator, give_creator_permissions, get_role_codenames, to_permissions, get_role_from_object_role
 from awx.main.fields import ImplicitRoleField
 from awx.main.utils import (
-    get_type_for_model,
     get_model_for_type,
     camelcase_to_underscore,
     getattrd,
@@ -114,7 +111,9 @@ from awx.main.utils import (
     truncate_stdout,
     get_licenser,
 )
+
 from awx.main.utils.filters import SmartFilter
+from awx.main.utils.plugins import load_combined_inventory_source_options
 from awx.main.utils.named_url_graph import reset_counters
 from awx.main.scheduler.task_manager_models import TaskManagerModels
 from awx.main.redact import UriCleaner, REPLACE_STR
@@ -128,8 +127,6 @@ from awx.api.fields import BooleanNullField, CharNullField, ChoiceNullField, Ver
 
 # AWX Utils
 from awx.api.validators import HostnameRegexValidator
-
-from awx.sso.common import get_external_account
 
 logger = logging.getLogger('awx.api.serializers')
 
@@ -189,6 +186,7 @@ SUMMARIZABLE_FK_FIELDS = {
     'webhook_credential': DEFAULT_SUMMARY_FIELDS + ('kind', 'cloud', 'credential_type_id'),
     'approved_or_denied_by': ('id', 'username', 'first_name', 'last_name'),
     'credential_type': DEFAULT_SUMMARY_FIELDS,
+    'resource': ('ansible_id', 'resource_type'),
 }
 
 
@@ -635,7 +633,7 @@ class BaseSerializer(serializers.ModelSerializer, metaclass=BaseSerializerMetacl
             exclusions = self.get_validation_exclusions(self.instance)
             obj = self.instance or self.Meta.model()
             for k, v in attrs.items():
-                if k not in exclusions:
+                if k not in exclusions and k != 'canonical_address_port':
                     setattr(obj, k, v)
             obj.full_clean(exclude=exclusions)
             # full_clean may modify values on the instance; copy those changes
@@ -955,8 +953,6 @@ class UnifiedJobStdoutSerializer(UnifiedJobSerializer):
 
 class UserSerializer(BaseSerializer):
     password = serializers.CharField(required=False, default='', help_text=_('Field used to change the password.'))
-    ldap_dn = serializers.CharField(source='profile.ldap_dn', read_only=True)
-    external_account = serializers.SerializerMethodField(help_text=_('Set if the account is managed by an external service'))
     is_system_auditor = serializers.BooleanField(default=False)
     show_capabilities = ['edit', 'delete']
 
@@ -973,22 +969,13 @@ class UserSerializer(BaseSerializer):
             'is_superuser',
             'is_system_auditor',
             'password',
-            'ldap_dn',
             'last_login',
-            'external_account',
         )
         extra_kwargs = {'last_login': {'read_only': True}}
 
     def to_representation(self, obj):
         ret = super(UserSerializer, self).to_representation(obj)
-        if self.get_external_account(obj):
-            # If this is an external account it shouldn't have a password field
-            ret.pop('password', None)
-        else:
-            # If its an internal account lets assume there is a password and return $encrypted$ to the user
-            ret['password'] = '$encrypted$'
-        if obj and type(self) is UserSerializer:
-            ret['auth'] = obj.social_auth.values('provider', 'uid')
+        ret['password'] = '$encrypted$'
         return ret
 
     def get_validation_exclusions(self, obj=None):
@@ -1021,10 +1008,7 @@ class UserSerializer(BaseSerializer):
         return value
 
     def _update_password(self, obj, new_password):
-        # For now we're not raising an error, just not saving password for
-        # users managed by LDAP who already have an unusable password set.
-        # Get external password will return something like ldap or enterprise or None if the user isn't external. We only want to allow a password update for a None option
-        if new_password and new_password != '$encrypted$' and not self.get_external_account(obj):
+        if new_password and new_password != '$encrypted$':
             obj.set_password(new_password)
             obj.save(update_fields=['password'])
 
@@ -1032,13 +1016,12 @@ class UserSerializer(BaseSerializer):
             # as the modified user then inject a session key derived from
             # the updated user to prevent logout. This is the logic used by
             # the Django admin's own user_change_password view.
-            update_session_auth_hash(self.context['request'], obj)
+            if self.instance and self.context['request'].user.username == obj.username:
+                update_session_auth_hash(self.context['request'], obj)
+
         elif not obj.password:
             obj.set_unusable_password()
             obj.save(update_fields=['password'])
-
-    def get_external_account(self, obj):
-        return get_external_account(obj)
 
     def create(self, validated_data):
         new_password = validated_data.pop('password', None)
@@ -1070,43 +1053,9 @@ class UserSerializer(BaseSerializer):
                 roles=self.reverse('api:user_roles_list', kwargs={'pk': obj.pk}),
                 activity_stream=self.reverse('api:user_activity_stream_list', kwargs={'pk': obj.pk}),
                 access_list=self.reverse('api:user_access_list', kwargs={'pk': obj.pk}),
-                tokens=self.reverse('api:o_auth2_token_list', kwargs={'pk': obj.pk}),
-                authorized_tokens=self.reverse('api:user_authorized_token_list', kwargs={'pk': obj.pk}),
-                personal_tokens=self.reverse('api:user_personal_token_list', kwargs={'pk': obj.pk}),
             )
         )
         return res
-
-    def _validate_ldap_managed_field(self, value, field_name):
-        if not getattr(settings, 'AUTH_LDAP_SERVER_URI', None):
-            return value
-        try:
-            is_ldap_user = bool(self.instance and self.instance.profile.ldap_dn)
-        except AttributeError:
-            is_ldap_user = False
-        if is_ldap_user:
-            ldap_managed_fields = ['username']
-            ldap_managed_fields.extend(getattr(settings, 'AUTH_LDAP_USER_ATTR_MAP', {}).keys())
-            ldap_managed_fields.extend(getattr(settings, 'AUTH_LDAP_USER_FLAGS_BY_GROUP', {}).keys())
-            if field_name in ldap_managed_fields:
-                if value != getattr(self.instance, field_name):
-                    raise serializers.ValidationError(_('Unable to change %s on user managed by LDAP.') % field_name)
-        return value
-
-    def validate_username(self, value):
-        return self._validate_ldap_managed_field(value, 'username')
-
-    def validate_first_name(self, value):
-        return self._validate_ldap_managed_field(value, 'first_name')
-
-    def validate_last_name(self, value):
-        return self._validate_ldap_managed_field(value, 'last_name')
-
-    def validate_email(self, value):
-        return self._validate_ldap_managed_field(value, 'email')
-
-    def validate_is_superuser(self, value):
-        return self._validate_ldap_managed_field(value, 'is_superuser')
 
 
 class UserActivityStreamSerializer(UserSerializer):
@@ -1118,199 +1067,6 @@ class UserActivityStreamSerializer(UserSerializer):
     class Meta:
         model = User
         fields = ('*', '-is_system_auditor')
-
-
-class BaseOAuth2TokenSerializer(BaseSerializer):
-    refresh_token = serializers.SerializerMethodField()
-    token = serializers.SerializerMethodField()
-    ALLOWED_SCOPES = ['read', 'write']
-
-    class Meta:
-        model = OAuth2AccessToken
-        fields = ('*', '-name', 'description', 'user', 'token', 'refresh_token', 'application', 'expires', 'scope')
-        read_only_fields = ('user', 'token', 'expires', 'refresh_token')
-        extra_kwargs = {'scope': {'allow_null': False, 'required': False}, 'user': {'allow_null': False, 'required': True}}
-
-    def get_token(self, obj):
-        request = self.context.get('request', None)
-        try:
-            if request.method == 'POST':
-                return obj.token
-            else:
-                return CENSOR_VALUE
-        except ObjectDoesNotExist:
-            return ''
-
-    def get_refresh_token(self, obj):
-        request = self.context.get('request', None)
-        try:
-            if not obj.refresh_token:
-                return None
-            elif request.method == 'POST':
-                return getattr(obj.refresh_token, 'token', '')
-            else:
-                return CENSOR_VALUE
-        except ObjectDoesNotExist:
-            return None
-
-    def get_related(self, obj):
-        ret = super(BaseOAuth2TokenSerializer, self).get_related(obj)
-        if obj.user:
-            ret['user'] = self.reverse('api:user_detail', kwargs={'pk': obj.user.pk})
-        if obj.application:
-            ret['application'] = self.reverse('api:o_auth2_application_detail', kwargs={'pk': obj.application.pk})
-        ret['activity_stream'] = self.reverse('api:o_auth2_token_activity_stream_list', kwargs={'pk': obj.pk})
-        return ret
-
-    def _is_valid_scope(self, value):
-        if not value or (not isinstance(value, str)):
-            return False
-        words = value.split()
-        for word in words:
-            if words.count(word) > 1:
-                return False  # do not allow duplicates
-            if word not in self.ALLOWED_SCOPES:
-                return False
-        return True
-
-    def validate_scope(self, value):
-        if not self._is_valid_scope(value):
-            raise serializers.ValidationError(_('Must be a simple space-separated string with allowed scopes {}.').format(self.ALLOWED_SCOPES))
-        return value
-
-    def create(self, validated_data):
-        validated_data['user'] = self.context['request'].user
-        try:
-            return super(BaseOAuth2TokenSerializer, self).create(validated_data)
-        except oauth2.AccessDeniedError as e:
-            raise PermissionDenied(str(e))
-
-
-class UserAuthorizedTokenSerializer(BaseOAuth2TokenSerializer):
-    class Meta:
-        extra_kwargs = {
-            'scope': {'allow_null': False, 'required': False},
-            'user': {'allow_null': False, 'required': True},
-            'application': {'allow_null': False, 'required': True},
-        }
-
-    def create(self, validated_data):
-        current_user = self.context['request'].user
-        validated_data['token'] = generate_token()
-        validated_data['expires'] = now() + timedelta(seconds=settings.OAUTH2_PROVIDER['ACCESS_TOKEN_EXPIRE_SECONDS'])
-        obj = super(UserAuthorizedTokenSerializer, self).create(validated_data)
-        obj.save()
-        if obj.application:
-            RefreshToken.objects.create(user=current_user, token=generate_token(), application=obj.application, access_token=obj)
-        return obj
-
-
-class OAuth2TokenSerializer(BaseOAuth2TokenSerializer):
-    def create(self, validated_data):
-        current_user = self.context['request'].user
-        validated_data['token'] = generate_token()
-        validated_data['expires'] = now() + timedelta(seconds=settings.OAUTH2_PROVIDER['ACCESS_TOKEN_EXPIRE_SECONDS'])
-        obj = super(OAuth2TokenSerializer, self).create(validated_data)
-        if obj.application and obj.application.user:
-            obj.user = obj.application.user
-        obj.save()
-        if obj.application:
-            RefreshToken.objects.create(user=current_user, token=generate_token(), application=obj.application, access_token=obj)
-        return obj
-
-
-class OAuth2TokenDetailSerializer(OAuth2TokenSerializer):
-    class Meta:
-        read_only_fields = ('*', 'user', 'application')
-
-
-class UserPersonalTokenSerializer(BaseOAuth2TokenSerializer):
-    class Meta:
-        read_only_fields = ('user', 'token', 'expires', 'application')
-
-    def create(self, validated_data):
-        validated_data['token'] = generate_token()
-        validated_data['expires'] = now() + timedelta(seconds=settings.OAUTH2_PROVIDER['ACCESS_TOKEN_EXPIRE_SECONDS'])
-        validated_data['application'] = None
-        obj = super(UserPersonalTokenSerializer, self).create(validated_data)
-        obj.save()
-        return obj
-
-
-class OAuth2ApplicationSerializer(BaseSerializer):
-    show_capabilities = ['edit', 'delete']
-
-    class Meta:
-        model = OAuth2Application
-        fields = (
-            '*',
-            'description',
-            '-user',
-            'client_id',
-            'client_secret',
-            'client_type',
-            'redirect_uris',
-            'authorization_grant_type',
-            'skip_authorization',
-            'organization',
-        )
-        read_only_fields = ('client_id', 'client_secret')
-        read_only_on_update_fields = ('user', 'authorization_grant_type')
-        extra_kwargs = {
-            'user': {'allow_null': True, 'required': False},
-            'organization': {'allow_null': False},
-            'authorization_grant_type': {'allow_null': False, 'label': _('Authorization Grant Type')},
-            'client_secret': {'label': _('Client Secret')},
-            'client_type': {'label': _('Client Type')},
-            'redirect_uris': {'label': _('Redirect URIs')},
-            'skip_authorization': {'label': _('Skip Authorization')},
-        }
-
-    def to_representation(self, obj):
-        ret = super(OAuth2ApplicationSerializer, self).to_representation(obj)
-        request = self.context.get('request', None)
-        if request.method != 'POST' and obj.client_type == 'confidential':
-            ret['client_secret'] = CENSOR_VALUE
-        if obj.client_type == 'public':
-            ret.pop('client_secret', None)
-        return ret
-
-    def get_related(self, obj):
-        res = super(OAuth2ApplicationSerializer, self).get_related(obj)
-        res.update(
-            dict(
-                tokens=self.reverse('api:o_auth2_application_token_list', kwargs={'pk': obj.pk}),
-                activity_stream=self.reverse('api:o_auth2_application_activity_stream_list', kwargs={'pk': obj.pk}),
-            )
-        )
-        if obj.organization_id:
-            res.update(
-                dict(
-                    organization=self.reverse('api:organization_detail', kwargs={'pk': obj.organization_id}),
-                )
-            )
-        return res
-
-    def get_modified(self, obj):
-        if obj is None:
-            return None
-        return obj.updated
-
-    def _summary_field_tokens(self, obj):
-        token_list = [{'id': x.pk, 'token': CENSOR_VALUE, 'scope': x.scope} for x in obj.oauth2accesstoken_set.all()[:10]]
-        if has_model_field_prefetched(obj, 'oauth2accesstoken_set'):
-            token_count = len(obj.oauth2accesstoken_set.all())
-        else:
-            if len(token_list) < 10:
-                token_count = len(token_list)
-            else:
-                token_count = obj.oauth2accesstoken_set.count()
-        return {'count': token_count, 'results': token_list}
-
-    def get_summary_fields(self, obj):
-        ret = super(OAuth2ApplicationSerializer, self).get_summary_fields(obj)
-        ret['tokens'] = self._summary_field_tokens(obj)
-        return ret
 
 
 class OrganizationSerializer(BaseSerializer):
@@ -1333,7 +1089,6 @@ class OrganizationSerializer(BaseSerializer):
             admins=self.reverse('api:organization_admins_list', kwargs={'pk': obj.pk}),
             teams=self.reverse('api:organization_teams_list', kwargs={'pk': obj.pk}),
             credentials=self.reverse('api:organization_credential_list', kwargs={'pk': obj.pk}),
-            applications=self.reverse('api:organization_applications_list', kwargs={'pk': obj.pk}),
             activity_stream=self.reverse('api:organization_activity_stream_list', kwargs={'pk': obj.pk}),
             notification_templates=self.reverse('api:organization_notification_templates_list', kwargs={'pk': obj.pk}),
             notification_templates_started=self.reverse('api:organization_notification_templates_started_list', kwargs={'pk': obj.pk}),
@@ -1806,7 +1561,7 @@ class ConstructedInventorySerializer(InventorySerializer):
         required=False,
         allow_null=True,
         min_value=0,
-        max_value=2,
+        max_value=5,
         default=None,
         help_text=_('The verbosity level for the related auto-created inventory source, special to constructed inventory'),
     )
@@ -2201,6 +1956,99 @@ class BulkHostCreateSerializer(serializers.Serializer):
         return return_data
 
 
+class BulkHostDeleteSerializer(serializers.Serializer):
+    hosts = serializers.ListField(
+        allow_empty=False,
+        max_length=100000,
+        write_only=True,
+        help_text=_('List of hosts ids to be deleted, e.g. [105, 130, 131, 200]'),
+    )
+
+    class Meta:
+        model = Host
+        fields = ('hosts',)
+
+    def validate(self, attrs):
+        request = self.context.get('request', None)
+        max_hosts = settings.BULK_HOST_MAX_DELETE
+        # Validating the number of hosts to be deleted
+        if len(attrs['hosts']) > max_hosts:
+            raise serializers.ValidationError(
+                {
+                    "ERROR": 'Number of hosts exceeds system setting BULK_HOST_MAX_DELETE',
+                    "BULK_HOST_MAX_DELETE": max_hosts,
+                    "Hosts_count": len(attrs['hosts']),
+                }
+            )
+
+        # Getting list of all host objects, filtered by the list of the hosts to delete
+        attrs['host_qs'] = Host.objects.get_queryset().filter(pk__in=attrs['hosts']).only('id', 'inventory_id', 'name')
+
+        # Converting the queryset data in a dict. to reduce the number of queries when
+        # manipulating the data
+        attrs['hosts_data'] = attrs['host_qs'].values()
+
+        if len(attrs['host_qs']) == 0:
+            error_hosts = {host: "Hosts do not exist or you lack permission to delete it" for host in attrs['hosts']}
+            raise serializers.ValidationError({'hosts': error_hosts})
+
+        if len(attrs['host_qs']) < len(attrs['hosts']):
+            hosts_exists = [host['id'] for host in attrs['hosts_data']]
+            failed_hosts = list(set(attrs['hosts']).difference(hosts_exists))
+            error_hosts = {host: "Hosts do not exist or you lack permission to delete it" for host in failed_hosts}
+            raise serializers.ValidationError({'hosts': error_hosts})
+
+        # Getting all inventories that the hosts can be in
+        inv_list = list(set([host['inventory_id'] for host in attrs['hosts_data']]))
+
+        # Checking that the user have permission to all inventories
+        errors = dict()
+        for inv in Inventory.objects.get_queryset().filter(pk__in=inv_list):
+            if request and not request.user.is_superuser:
+                if request.user not in inv.admin_role:
+                    errors[inv.name] = "Lack permissions to delete hosts from this inventory."
+        if errors != {}:
+            raise PermissionDenied({"inventories": errors})
+
+        # check the inventory type only if the user have permission to it.
+        errors = dict()
+        for inv in Inventory.objects.get_queryset().filter(pk__in=inv_list):
+            if inv.kind != '':
+                errors[inv.name] = "Hosts can only be deleted from manual inventories."
+        if errors != {}:
+            raise serializers.ValidationError({"inventories": errors})
+        attrs['inventories'] = inv_list
+        return attrs
+
+    def delete(self, validated_data):
+        result = {"hosts": dict()}
+        changes = {'deleted_hosts': dict()}
+        for inventory in validated_data['inventories']:
+            changes['deleted_hosts'][inventory] = list()
+
+        for host in validated_data['hosts_data']:
+            result["hosts"][host["id"]] = f"The host {host['name']} was deleted"
+            changes['deleted_hosts'][host["inventory_id"]].append({"host_id": host["id"], "host_name": host["name"]})
+
+        try:
+            validated_data['host_qs'].delete()
+        except Exception as e:
+            raise serializers.ValidationError({"detail": _(f"cannot delete hosts, host deletion error {e}")})
+
+        request = self.context.get('request', None)
+
+        for inventory in validated_data['inventories']:
+            activity_entry = ActivityStream.objects.create(
+                operation='update',
+                object1='inventory',
+                changes=json.dumps(changes['deleted_hosts'][inventory]),
+                actor=request.user,
+            )
+            activity_entry.inventory.add(inventory)
+
+        return result
+
+
 class GroupTreeSerializer(GroupSerializer):
     children = serializers.SerializerMethodField()
 
@@ -2249,6 +2097,7 @@ class GroupVariableDataSerializer(BaseVariableDataSerializer):
 
 class InventorySourceOptionsSerializer(BaseSerializer):
     credential = DeprecatedCredentialField(help_text=_('Cloud credential to use for inventory updates.'))
+    source = serializers.ChoiceField(choices=[])
 
     class Meta:
         fields = (
@@ -2269,6 +2118,14 @@ class InventorySourceOptionsSerializer(BaseSerializer):
             'limit',
         )
         read_only_fields = ('*', 'custom_virtualenv')
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        if 'source' in self.fields:
+            source_options = load_combined_inventory_source_options()
+
+            self.fields['source'].choices = [(plugin, description) for plugin, description in source_options.items()]
 
     def get_related(self, obj):
         res = super(InventorySourceOptionsSerializer, self).get_related(obj)
@@ -2664,6 +2521,30 @@ class ResourceAccessListElementSerializer(UserSerializer):
         if 'summary_fields' not in ret:
             ret['summary_fields'] = {}
 
+        team_content_type = ContentType.objects.get_for_model(Team)
+        content_type = ContentType.objects.get_for_model(obj)
+
+        reversed_org_map = {}
+        for k, v in org_role_to_permission.items():
+            reversed_org_map[v] = k
+        reversed_role_map = {}
+        for k, v in to_permissions.items():
+            reversed_role_map[v] = k
+
+        def get_roles_from_perms(perm_list):
+            """given a list of permission codenames return a list of role names"""
+            role_names = set()
+            for codename in perm_list:
+                action = codename.split('_', 1)[0]
+                if action in reversed_role_map:
+                    role_names.add(reversed_role_map[action])
+                elif codename in reversed_org_map:
+                    if isinstance(obj, Organization):
+                        role_names.add(reversed_org_map[codename])
+                        if 'view_organization' not in role_names:
+                            role_names.add('read_role')
+            return list(role_names)
+
         def format_role_perm(role):
             role_dict = {'id': role.id, 'name': role.name, 'description': role.description}
             try:
@@ -2679,13 +2560,21 @@ class ResourceAccessListElementSerializer(UserSerializer):
             else:
                 # Singleton roles should not be managed from this view, as per copy/edit rework spec
                 role_dict['user_capabilities'] = {'unattach': False}
-            return {'role': role_dict, 'descendant_roles': get_roles_on_resource(obj, role)}
+
+            model_name = content_type.model
+            if isinstance(obj, Organization):
+                descendant_perms = [codename for codename in get_role_codenames(role) if codename.endswith(model_name) or codename.startswith('add_')]
+            else:
+                descendant_perms = [codename for codename in get_role_codenames(role) if codename.endswith(model_name)]
+
+            return {'role': role_dict, 'descendant_roles': get_roles_from_perms(descendant_perms)}
 
         def format_team_role_perm(naive_team_role, permissive_role_ids):
             ret = []
+            team = naive_team_role.content_object
             team_role = naive_team_role
             if naive_team_role.role_field == 'admin_role':
-                team_role = naive_team_role.content_object.member_role
+                team_role = team.member_role
             for role in team_role.children.filter(id__in=permissive_role_ids).all():
                 role_dict = {
                     'id': role.id,
@@ -2705,13 +2594,87 @@ class ResourceAccessListElementSerializer(UserSerializer):
                 else:
                     # Singleton roles should not be managed from this view, as per copy/edit rework spec
                     role_dict['user_capabilities'] = {'unattach': False}
-                ret.append({'role': role_dict, 'descendant_roles': get_roles_on_resource(obj, team_role)})
+
+                descendant_perms = list(
+                    RoleEvaluation.objects.filter(role__in=team.has_roles.all(), object_id=obj.id, content_type_id=content_type.id)
+                    .values_list('codename', flat=True)
+                    .distinct()
+                )
+
+                ret.append({'role': role_dict, 'descendant_roles': get_roles_from_perms(descendant_perms)})
             return ret
 
-        team_content_type = ContentType.objects.get_for_model(Team)
-        content_type = ContentType.objects.get_for_model(obj)
+        gfk_kwargs = dict(content_type_id=content_type.id, object_id=obj.id)
+        direct_permissive_role_ids = Role.objects.filter(**gfk_kwargs).values_list('id', flat=True)
 
-        direct_permissive_role_ids = Role.objects.filter(content_type=content_type, object_id=obj.id).values_list('id', flat=True)
+        if settings.ANSIBLE_BASE_ROLE_SYSTEM_ACTIVATED:
+            ret['summary_fields']['direct_access'] = []
+            ret['summary_fields']['indirect_access'] = []
+
+            new_roles_seen = set()
+            all_team_roles = set()
+            all_permissive_role_ids = set()
+            for evaluation in RoleEvaluation.objects.filter(role__in=user.has_roles.all(), **gfk_kwargs).prefetch_related('role'):
+                new_role = evaluation.role
+                if new_role.id in new_roles_seen:
+                    continue
+                new_roles_seen.add(new_role.id)
+                old_role = get_role_from_object_role(new_role)
+                all_permissive_role_ids.add(old_role.id)
+
+                if int(new_role.object_id) == obj.id and new_role.content_type_id == content_type.id:
+                    ret['summary_fields']['direct_access'].append(format_role_perm(old_role))
+                elif new_role.content_type_id == team_content_type.id:
+                    all_team_roles.add(old_role)
+                else:
+                    ret['summary_fields']['indirect_access'].append(format_role_perm(old_role))
+
+            # Lazy role creation gives us a big problem, where some intermediate roles are not easy to find
+            # like when a team has indirect permission, so here we get all roles the users teams have
+            # these contribute to all potential permission-granting roles of the object
+            user_teams_qs = permission_registry.team_model.objects.filter(member_roles__in=ObjectRole.objects.filter(users=user))
+            team_obj_roles = ObjectRole.objects.filter(teams__in=user_teams_qs)
+            for evaluation in RoleEvaluation.objects.filter(role__in=team_obj_roles, **gfk_kwargs).prefetch_related('role'):
+                new_role = evaluation.role
+                if new_role.id in new_roles_seen:
+                    continue
+                new_roles_seen.add(new_role.id)
+                old_role = get_role_from_object_role(new_role)
+                all_permissive_role_ids.add(old_role.id)
+
+            # In DAB RBAC, superuser is strictly a user flag, and global roles are not in the RoleEvaluation table
+            if user.is_superuser:
+                ret['summary_fields'].setdefault('indirect_access', [])
+                all_role_names = [field.name for field in obj._meta.get_fields() if isinstance(field, ImplicitRoleField)]
+                ret['summary_fields']['indirect_access'].append(
+                    {
+                        "role": {
+                            "id": None,
+                            "name": _("System Administrator"),
+                            "description": _("Can manage all aspects of the system"),
+                            "user_capabilities": {"unattach": False},
+                        },
+                        "descendant_roles": all_role_names,
+                    }
+                )
+            elif user.is_system_auditor:
+                ret['summary_fields'].setdefault('indirect_access', [])
+                ret['summary_fields']['indirect_access'].append(
+                    {
+                        "role": {
+                            "id": None,
+                            "name": _("Controller System Auditor"),
+                            "description": _("Can view all aspects of the system"),
+                            "user_capabilities": {"unattach": False},
+                        },
+                        "descendant_roles": ["read_role"],
+                    }
+                )
+
+            ret['summary_fields']['direct_access'].extend([y for x in (format_team_role_perm(r, all_permissive_role_ids) for r in all_team_roles) for y in x])
+
+            return ret
+
         all_permissive_role_ids = Role.objects.filter(content_type=content_type, object_id=obj.id).values_list('ancestors__id', flat=True)
 
         direct_access_roles = user.roles.filter(id__in=direct_permissive_role_ids).all()
@@ -2980,7 +2943,7 @@ class CredentialSerializerCreate(CredentialSerializer):
         credential = super(CredentialSerializerCreate, self).create(validated_data)
 
         if user:
-            credential.admin_role.members.add(user)
+            give_creator_permissions(user, credential)
         if team:
             if not credential.organization or team.organization.id != credential.organization.id:
                 raise serializers.ValidationError({"detail": _("Credential organization must be set and match before assigning to a team")})
@@ -3233,7 +3196,7 @@ class JobTemplateSerializer(JobTemplateMixin, UnifiedJobTemplateSerializer, JobO
         if get_field_from_model_or_attrs('host_config_key') and not inventory:
             raise serializers.ValidationError({'host_config_key': _("Cannot enable provisioning callback without an inventory set.")})
 
-        prompting_error_message = _("Must either set a default value or ask to prompt on launch.")
+        prompting_error_message = _("You must either set a default value or ask to prompt on launch.")
         if project is None:
             raise serializers.ValidationError({'project': _("Job Templates must have a project assigned.")})
         elif inventory is None and not get_field_from_model_or_attrs('ask_inventory_on_launch'):
@@ -5074,16 +5037,21 @@ class NotificationTemplateSerializer(BaseSerializer):
                 body = messages[event].get('body', {})
                 if body:
                     try:
-                        rendered_body = (
-                            sandbox.ImmutableSandboxedEnvironment(undefined=DescriptiveUndefined).from_string(body).render(JobNotificationMixin.context_stub())
-                        )
-                        potential_body = json.loads(rendered_body)
-                        if not isinstance(potential_body, dict):
-                            error_list.append(
-                                _("Webhook body for '{}' should be a json dictionary. Found type '{}'.".format(event, type(potential_body).__name__))
-                            )
-                    except json.JSONDecodeError as exc:
-                        error_list.append(_("Webhook body for '{}' is not a valid json dictionary ({}).".format(event, exc)))
+                        sandbox.ImmutableSandboxedEnvironment(undefined=DescriptiveUndefined).from_string(body).render(JobNotificationMixin.context_stub())
+
+                        # https://github.com/ansible/awx/issues/14410
+
+                        # When rendering something such as "{{ job.id }}"
+                        # the return type is not a dict, unlike "{{ job_metadata }}" which is a dict
+
+                        # potential_body = json.loads(rendered_body)
+
+                        # if not isinstance(potential_body, dict):
+                        #     error_list.append(
+                        #         _("Webhook body for '{}' should be a json dictionary. Found type '{}'.".format(event, type(potential_body).__name__))
+                        #     )
+                    except Exception as exc:
+                        error_list.append(_("Webhook body for '{}' is not valid. The following gave an error ({}).".format(event, exc)))
 
         if error_list:
             raise serializers.ValidationError(error_list)
@@ -5171,7 +5139,7 @@ class NotificationSerializer(BaseSerializer):
         )
 
     def get_body(self, obj):
-        if obj.notification_type in ('webhook', 'pagerduty'):
+        if obj.notification_type in ('webhook', 'pagerduty', 'awssns'):
             if isinstance(obj.body, dict):
                 if 'body' in obj.body:
                     return obj.body['body']
@@ -5193,9 +5161,9 @@ class NotificationSerializer(BaseSerializer):
     def to_representation(self, obj):
         ret = super(NotificationSerializer, self).to_representation(obj)
 
-        if obj.notification_type == 'webhook':
+        if obj.notification_type in ('webhook', 'awssns'):
             ret.pop('subject')
-        if obj.notification_type not in ('email', 'webhook', 'pagerduty'):
+        if obj.notification_type not in ('email', 'webhook', 'pagerduty', 'awssns'):
             ret.pop('body')
         return ret
 
@@ -5338,7 +5306,7 @@ class ScheduleSerializer(LaunchConfigurationBaseSerializer, SchedulePreviewSeria
         return summary_fields
 
     def validate_unified_job_template(self, value):
-        if type(value) == InventorySource and value.source not in CLOUD_INVENTORY_SOURCES:
+        if type(value) == InventorySource and value.source not in load_combined_inventory_source_options():
             raise serializers.ValidationError(_('Inventory Source must be a cloud resource.'))
         elif type(value) == Project and value.scm_type == '':
             raise serializers.ValidationError(_('Manual Project cannot have a schedule set.'))
@@ -5356,16 +5324,53 @@ class ScheduleSerializer(LaunchConfigurationBaseSerializer, SchedulePreviewSeria
 class InstanceLinkSerializer(BaseSerializer):
     class Meta:
         model = InstanceLink
-        fields = ('source', 'target', 'link_state')
+        fields = ('id', 'related', 'source', 'target', 'target_full_address', 'link_state')
 
-    source = serializers.SlugRelatedField(slug_field="hostname", read_only=True)
-    target = serializers.SlugRelatedField(slug_field="hostname", read_only=True)
+    source = serializers.SlugRelatedField(slug_field="hostname", queryset=Instance.objects.all())
+
+    target = serializers.SerializerMethodField()
+    target_full_address = serializers.SerializerMethodField()
+
+    def get_related(self, obj):
+        res = super(InstanceLinkSerializer, self).get_related(obj)
+        res['source_instance'] = self.reverse('api:instance_detail', kwargs={'pk': obj.source.id})
+        res['target_address'] = self.reverse('api:receptor_address_detail', kwargs={'pk': obj.target.id})
+        return res
+
+    def get_target(self, obj):
+        return obj.target.instance.hostname
+
+    def get_target_full_address(self, obj):
+        return obj.target.get_full_address()
 
 
 class InstanceNodeSerializer(BaseSerializer):
     class Meta:
         model = Instance
         fields = ('id', 'hostname', 'node_type', 'node_state', 'enabled')
+
+
+class ReceptorAddressSerializer(BaseSerializer):
+    full_address = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ReceptorAddress
+        fields = (
+            'id',
+            'url',
+            'address',
+            'port',
+            'protocol',
+            'websocket_path',
+            'is_internal',
+            'canonical',
+            'instance',
+            'peers_from_control_nodes',
+            'full_address',
+        )
+
+    def get_full_address(self, obj):
+        return obj.get_full_address()
 
 
 class InstanceSerializer(BaseSerializer):
@@ -5376,10 +5381,17 @@ class InstanceSerializer(BaseSerializer):
     jobs_running = serializers.IntegerField(help_text=_('Count of jobs in the running or waiting state that are targeted for this instance'), read_only=True)
     jobs_total = serializers.IntegerField(help_text=_('Count of all jobs that target this instance'), read_only=True)
     health_check_pending = serializers.SerializerMethodField()
+    peers = serializers.PrimaryKeyRelatedField(
+        help_text=_('Primary keys of receptor addresses to peer to.'), many=True, required=False, queryset=ReceptorAddress.objects.all()
+    )
+    reverse_peers = serializers.SerializerMethodField()
+    listener_port = serializers.IntegerField(source='canonical_address_port', required=False, allow_null=True)
+    peers_from_control_nodes = serializers.BooleanField(source='canonical_address_peers_from_control_nodes', required=False)
+    protocol = serializers.SerializerMethodField()
 
     class Meta:
         model = Instance
-        read_only_fields = ('ip_address', 'uuid', 'version')
+        read_only_fields = ('ip_address', 'uuid', 'version', 'managed', 'reverse_peers')
         fields = (
             'id',
             'hostname',
@@ -5410,8 +5422,13 @@ class InstanceSerializer(BaseSerializer):
             'managed_by_policy',
             'node_type',
             'node_state',
+            'managed',
             'ip_address',
+            'peers',
+            'reverse_peers',
             'listener_port',
+            'peers_from_control_nodes',
+            'protocol',
         )
         extra_kwargs = {
             'node_type': {'initial': Instance.Types.EXECUTION, 'default': Instance.Types.EXECUTION},
@@ -5433,15 +5450,53 @@ class InstanceSerializer(BaseSerializer):
 
     def get_related(self, obj):
         res = super(InstanceSerializer, self).get_related(obj)
+        res['receptor_addresses'] = self.reverse('api:instance_receptor_addresses_list', kwargs={'pk': obj.pk})
         res['jobs'] = self.reverse('api:instance_unified_jobs_list', kwargs={'pk': obj.pk})
-        res['instance_groups'] = self.reverse('api:instance_instance_groups_list', kwargs={'pk': obj.pk})
-        if obj.node_type in [Instance.Types.EXECUTION, Instance.Types.HOP]:
-            res['install_bundle'] = self.reverse('api:instance_install_bundle', kwargs={'pk': obj.pk})
         res['peers'] = self.reverse('api:instance_peers_list', kwargs={"pk": obj.pk})
+        res['instance_groups'] = self.reverse('api:instance_instance_groups_list', kwargs={'pk': obj.pk})
+        if obj.node_type in [Instance.Types.EXECUTION, Instance.Types.HOP] and not obj.managed:
+            res['install_bundle'] = self.reverse('api:instance_install_bundle', kwargs={'pk': obj.pk})
         if self.context['request'].user.is_superuser or self.context['request'].user.is_system_auditor:
             if obj.node_type == 'execution':
                 res['health_check'] = self.reverse('api:instance_health_check', kwargs={'pk': obj.pk})
         return res
+
+    def create_or_update(self, validated_data, obj=None, create=True):
+        # create a managed receptor address if listener port is defined
+        port = validated_data.pop('listener_port', -1)
+        peers_from_control_nodes = validated_data.pop('peers_from_control_nodes', -1)
+
+        # delete the receptor address if the port is explicitly set to None
+        if obj and port == None:
+            obj.receptor_addresses.filter(address=obj.hostname).delete()
+
+        if create:
+            instance = super(InstanceSerializer, self).create(validated_data)
+        else:
+            instance = super(InstanceSerializer, self).update(obj, validated_data)
+            instance.refresh_from_db()  # instance canonical address lookup is deferred, so needs to be reloaded
+
+        # only create or update if port is defined in validated_data or already exists in the
+        # canonical address
+        # this prevents creating a receptor address if peers_from_control_nodes is in
+        # validated_data but a port is not set
+        if (port != None and port != -1) or instance.canonical_address_port:
+            kwargs = {}
+            if port != -1:
+                kwargs['port'] = port
+            if peers_from_control_nodes != -1:
+                kwargs['peers_from_control_nodes'] = peers_from_control_nodes
+            if kwargs:
+                kwargs['canonical'] = True
+                instance.receptor_addresses.update_or_create(address=instance.hostname, defaults=kwargs)
+
+        return instance
+
+    def create(self, validated_data):
+        return self.create_or_update(validated_data, create=True)
+
+    def update(self, obj, validated_data):
+        return self.create_or_update(validated_data, obj, create=False)
 
     def get_summary_fields(self, obj):
         summary = super().get_summary_fields(obj)
@@ -5451,6 +5506,16 @@ class InstanceSerializer(BaseSerializer):
             summary['links'] = InstanceLinkSerializer(InstanceLink.objects.select_related('target', 'source').filter(source=obj), many=True).data
 
         return summary
+
+    def get_reverse_peers(self, obj):
+        return Instance.objects.prefetch_related('peers').filter(peers__in=obj.receptor_addresses.all()).values_list('id', flat=True)
+
+    def get_protocol(self, obj):
+        # note: don't create a different query for receptor addresses, as this is prefetched on the View for optimization
+        for addr in obj.receptor_addresses.all():
+            if addr.canonical:
+                return addr.protocol
+        return ""
 
     def get_consumed_capacity(self, obj):
         return obj.consumed_capacity
@@ -5464,22 +5529,30 @@ class InstanceSerializer(BaseSerializer):
     def get_health_check_pending(self, obj):
         return obj.health_check_pending
 
-    def validate(self, data):
-        if self.instance:
-            if self.instance.node_type == Instance.Types.HOP:
-                raise serializers.ValidationError("Hop node instances may not be changed.")
-        else:
-            if not settings.IS_K8S:
-                raise serializers.ValidationError("Can only create instances on Kubernetes or OpenShift.")
-        return data
+    def validate(self, attrs):
+        # Oddly, using 'source' on a DRF field populates attrs with the source name, so we should rename it back
+        if 'canonical_address_port' in attrs:
+            attrs['listener_port'] = attrs.pop('canonical_address_port')
+        if 'canonical_address_peers_from_control_nodes' in attrs:
+            attrs['peers_from_control_nodes'] = attrs.pop('canonical_address_peers_from_control_nodes')
+
+        if not self.instance and not settings.IS_K8S:
+            raise serializers.ValidationError(_("Can only create instances on Kubernetes or OpenShift."))
+
+        # cannot enable peers_from_control_nodes if listener_port is not set
+        if attrs.get('peers_from_control_nodes'):
+            port = attrs.get('listener_port', -1)  # -1 denotes missing, None denotes explicit null
+            if (port is None) or (port == -1 and self.instance and self.instance.canonical_address is None):
+                raise serializers.ValidationError(_("Cannot enable peers_from_control_nodes if listener_port is not set."))
+
+        return super().validate(attrs)
 
     def validate_node_type(self, value):
-        if not self.instance:
-            if value not in (Instance.Types.EXECUTION,):
-                raise serializers.ValidationError("Can only create execution nodes.")
-        else:
-            if self.instance.node_type != value:
-                raise serializers.ValidationError("Cannot change node type.")
+        if not self.instance and value not in [Instance.Types.HOP, Instance.Types.EXECUTION]:
+            raise serializers.ValidationError(_("Can only create execution or hop nodes."))
+
+        if self.instance and self.instance.node_type != value:
+            raise serializers.ValidationError(_("Cannot change node type."))
 
         return value
 
@@ -5487,30 +5560,71 @@ class InstanceSerializer(BaseSerializer):
         if self.instance:
             if value != self.instance.node_state:
                 if not settings.IS_K8S:
-                    raise serializers.ValidationError("Can only change the state on Kubernetes or OpenShift.")
+                    raise serializers.ValidationError(_("Can only change the state on Kubernetes or OpenShift."))
                 if value != Instance.States.DEPROVISIONING:
-                    raise serializers.ValidationError("Can only change instances to the 'deprovisioning' state.")
-                if self.instance.node_type not in (Instance.Types.EXECUTION,):
-                    raise serializers.ValidationError("Can only deprovision execution nodes.")
+                    raise serializers.ValidationError(_("Can only change instances to the 'deprovisioning' state."))
+                if self.instance.managed:
+                    raise serializers.ValidationError(_("Cannot deprovision managed nodes."))
         else:
             if value and value != Instance.States.INSTALLED:
-                raise serializers.ValidationError("Can only create instances in the 'installed' state.")
+                raise serializers.ValidationError(_("Can only create instances in the 'installed' state."))
 
         return value
 
     def validate_hostname(self, value):
         """
-        - Hostname cannot be "localhost" - but can be something like localhost.domain
-        - Cannot change the hostname of an-already instantiated & initialized Instance object
+        Cannot change the hostname
         """
         if self.instance and self.instance.hostname != value:
-            raise serializers.ValidationError("Cannot change hostname.")
+            raise serializers.ValidationError(_("Cannot change hostname."))
 
         return value
 
     def validate_listener_port(self, value):
-        if self.instance and self.instance.listener_port != value:
-            raise serializers.ValidationError("Cannot change listener port.")
+        """
+        Cannot change listener port, unless going from none to integer, and vice versa
+        If instance is managed, cannot change listener port at all
+        """
+        if self.instance:
+            canonical_address_port = self.instance.canonical_address_port
+            if value and canonical_address_port and canonical_address_port != value:
+                raise serializers.ValidationError(_("Cannot change listener port."))
+            if self.instance.managed and value != canonical_address_port:
+                raise serializers.ValidationError(_("Cannot change listener port for managed nodes."))
+        return value
+
+    def validate_peers(self, value):
+        # cannot peer to an instance more than once
+        peers_instances = Counter(p.instance_id for p in value)
+        if any(count > 1 for count in peers_instances.values()):
+            raise serializers.ValidationError(_("Cannot peer to the same instance more than once."))
+
+        if self.instance:
+            instance_addresses = set(self.instance.receptor_addresses.all())
+            setting_peers = set(value)
+            peers_changed = set(self.instance.peers.all()) != setting_peers
+
+            if not settings.IS_K8S and peers_changed:
+                raise serializers.ValidationError(_("Cannot change peers."))
+
+            if self.instance.managed and peers_changed:
+                raise serializers.ValidationError(_("Setting peers manually for managed nodes is not allowed."))
+
+            # cannot peer to self
+            if instance_addresses & setting_peers:
+                raise serializers.ValidationError(_("Instance cannot peer to its own address."))
+
+            # cannot peer to an instance that is already peered to this instance
+            if instance_addresses:
+                for p in setting_peers:
+                    if set(p.instance.peers.all()) & instance_addresses:
+                        raise serializers.ValidationError(_(f"Instance {p.instance.hostname} is already peered to this instance."))
+
+        return value
+
+    def validate_peers_from_control_nodes(self, value):
+        if self.instance and self.instance.managed and self.instance.canonical_address_peers_from_control_nodes != value:
+            raise serializers.ValidationError(_("Cannot change peers_from_control_nodes for managed nodes."))
 
         return value
 
@@ -5518,7 +5632,19 @@ class InstanceSerializer(BaseSerializer):
 class InstanceHealthCheckSerializer(BaseSerializer):
     class Meta:
         model = Instance
-        read_only_fields = ('uuid', 'hostname', 'version', 'last_health_check', 'errors', 'cpu', 'memory', 'cpu_capacity', 'mem_capacity', 'capacity')
+        read_only_fields = (
+            'uuid',
+            'hostname',
+            'ip_address',
+            'version',
+            'last_health_check',
+            'errors',
+            'cpu',
+            'memory',
+            'cpu_capacity',
+            'mem_capacity',
+            'capacity',
+        )
         fields = read_only_fields
 
 
@@ -5754,8 +5880,6 @@ class ActivityStreamSerializer(BaseSerializer):
             ('workflow_job_template_node', ('id', 'unified_job_template_id')),
             ('label', ('id', 'name', 'organization_id')),
             ('notification', ('id', 'status', 'notification_type', 'notification_template_id')),
-            ('o_auth2_access_token', ('id', 'user_id', 'description', 'application_id', 'scope')),
-            ('o_auth2_application', ('id', 'name', 'description')),
             ('credential_type', ('id', 'name', 'description', 'kind', 'managed')),
             ('ad_hoc_command', ('id', 'name', 'status', 'limit')),
             ('workflow_approval', ('id', 'name', 'unified_job_id')),

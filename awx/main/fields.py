@@ -5,6 +5,7 @@
 import copy
 import json
 import re
+import sys
 import urllib.parse
 
 from jinja2 import sandbox, StrictUndefined
@@ -251,7 +252,7 @@ class ImplicitRoleField(models.ForeignKey):
         kwargs.setdefault('related_name', '+')
         kwargs.setdefault('null', 'True')
         kwargs.setdefault('editable', False)
-        kwargs.setdefault('on_delete', models.CASCADE)
+        kwargs.setdefault('on_delete', models.SET_NULL)
         super(ImplicitRoleField, self).__init__(*args, **kwargs)
 
     def deconstruct(self):
@@ -406,11 +407,13 @@ class SmartFilterField(models.TextField):
         # https://docs.python.org/2/library/stdtypes.html#truth-value-testing
         if not value:
             return None
-        value = urllib.parse.unquote(value)
-        try:
-            SmartFilter().query_from_string(value)
-        except RuntimeError as e:
-            raise models.base.ValidationError(e)
+        # avoid doing too much during migrations
+        if 'migrate' not in sys.argv:
+            value = urllib.parse.unquote(value)
+            try:
+                SmartFilter().query_from_string(value)
+            except RuntimeError as e:
+                raise models.base.ValidationError(e)
         return super(SmartFilterField, self).get_prep_value(value)
 
 
@@ -829,7 +832,7 @@ class CredentialTypeInjectorField(JSONSchemaField):
                             'type': 'string',
                             # The environment variable _value_ can be any ascii,
                             # but pexpect will choke on any unicode
-                            'pattern': '^[\x00-\x7F]*$',
+                            'pattern': '^[\x00-\x7f]*$',
                         },
                     },
                     'additionalProperties': False,
@@ -1036,7 +1039,7 @@ class OrderedManyToManyField(models.ManyToManyField):
             descriptor = getattr(instance, self.name)
             order_with_respect_to = descriptor.source_field_name
 
-            for i, ig in enumerate(sender.objects.filter(**{order_with_respect_to: instance.pk})):
+            for i, ig in enumerate(sender.objects.filter(**{order_with_respect_to: instance.pk}).order_by('id')):
                 if ig.position != i:
                     ig.position = i
                     ig.save()

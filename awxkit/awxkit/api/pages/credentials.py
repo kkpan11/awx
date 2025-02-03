@@ -31,6 +31,8 @@ credential_input_fields = (
     'become_password',
     'become_username',
     'client',
+    'client_id',
+    'client_secret',
     'cloud_environment',
     'domain',
     'host',
@@ -96,6 +98,7 @@ credential_type_name_to_config_kind_map = {
     'vault': 'vault',
     'vmware vcenter': 'vmware',
     'gpg public key': 'gpg_public_key',
+    'terraform backend configuration': 'terraform',
 }
 
 config_kind_to_credential_type_name_map = {kind: name for name, kind in credential_type_name_to_config_kind_map.items()}
@@ -131,6 +134,8 @@ def get_payload_field_and_value_from_kwargs_or_config_cred(field, kind, kwargs, 
         config_field = 'ad_user'
     elif field == 'client':
         config_field = 'client_id'
+    elif field == 'client_id' and 'azure' in kind:  # Needed to avoid service account client_id collision
+        config_field = ''
     elif field == 'authorize_password':
         config_field = 'authorize'
     else:

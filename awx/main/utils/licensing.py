@@ -15,7 +15,6 @@ from datetime import datetime, timezone
 import collections
 import copy
 import io
-import os
 import json
 import logging
 import re
@@ -34,6 +33,9 @@ from cryptography import x509
 # Django
 from django.conf import settings
 from django.utils.translation import gettext_lazy as _
+
+# Shared code for the AWX platform
+from awx_plugins.interfaces._temporary_private_licensing_api import detect_server_product_name
 
 from awx.main.constants import SUBSCRIPTION_USAGE_MODEL_UNIQUE_HOSTS
 
@@ -199,6 +201,8 @@ class Licenser(object):
                     license['support_level'] = attr.get('value')
                 elif attr.get('name') == 'usage':
                     license['usage'] = attr.get('value')
+                elif attr.get('name') == 'ph_product_name' and attr.get('value') == 'RHEL Developer':
+                    license['license_type'] = 'developer'
 
         if not license:
             logger.error("No valid subscriptions found in manifest")
@@ -292,7 +296,7 @@ class Licenser(object):
                     license['productId'] = sub['product_id']
                     license['quantity'] = int(sub['quantity'])
                     license['support_level'] = sub['support_level']
-                    license['usage'] = sub['usage']
+                    license['usage'] = sub.get('usage')
                     license['subscription_name'] = sub['name']
                     license['subscriptionId'] = sub['subscription_id']
                     license['accountNumber'] = sub['account_number']
@@ -322,7 +326,9 @@ class Licenser(object):
     def generate_license_options_from_entitlements(self, json):
         from dateutil.parser import parse
 
-        ValidSub = collections.namedtuple('ValidSub', 'sku name support_level end_date trial quantity pool_id satellite subscription_id account_number usage')
+        ValidSub = collections.namedtuple(
+            'ValidSub', 'sku name support_level end_date trial developer_license quantity pool_id satellite subscription_id account_number usage'
+        )
         valid_subs = []
         for sub in json:
             satellite = sub.get('satellite')
@@ -350,6 +356,7 @@ class Licenser(object):
 
                 sku = sub['productId']
                 trial = sku.startswith('S')  # i.e.,, SER/SVC
+                developer_license = False
                 support_level = ''
                 usage = ''
                 pool_id = sub['id']
@@ -364,9 +371,24 @@ class Licenser(object):
                             support_level = attr.get('value')
                         elif attr.get('name') == 'usage':
                             usage = attr.get('value')
+                        elif attr.get('name') == 'ph_product_name' and attr.get('value') == 'RHEL Developer':
+                            developer_license = True
 
                 valid_subs.append(
-                    ValidSub(sku, sub['productName'], support_level, end_date, trial, quantity, pool_id, satellite, subscription_id, account_number, usage)
+                    ValidSub(
+                        sku,
+                        sub['productName'],
+                        support_level,
+                        end_date,
+                        trial,
+                        developer_license,
+                        quantity,
+                        pool_id,
+                        satellite,
+                        subscription_id,
+                        account_number,
+                        usage,
+                    )
                 )
 
         if valid_subs:
@@ -381,6 +403,8 @@ class Licenser(object):
                 if sub.trial:
                     license._attrs['trial'] = True
                     license._attrs['license_type'] = 'trial'
+                if sub.developer_license:
+                    license._attrs['license_type'] = 'developer'
                 license._attrs['instance_count'] = min(MAX_INSTANCES, license._attrs['instance_count'])
                 human_instances = license._attrs['instance_count']
                 if human_instances == MAX_INSTANCES:
@@ -428,7 +452,12 @@ class Licenser(object):
         if first_host:
             automated_since = int(first_host.first_automation.timestamp())
         else:
-            automated_since = int(Instance.objects.order_by('id').first().created.timestamp())
+            try:
+                automated_since = int(Instance.objects.order_by('id').first().created.timestamp())
+            except AttributeError:
+                # In the odd scenario that create_preload_data was not run, there are no hosts
+                # Then we CAN end up here before any instance has registered
+                automated_since = int(time.time())
         instance_count = int(attrs.get('instance_count', 0))
         attrs['current_instances'] = current_instances
         attrs['automated_instances'] = automated_instances
@@ -453,13 +482,9 @@ def get_licenser(*args, **kwargs):
     from awx.main.utils.licensing import Licenser, OpenLicense
 
     try:
-        if os.path.exists('/var/lib/awx/.tower_version'):
-            return Licenser(*args, **kwargs)
-        else:
+        if detect_server_product_name() == 'AWX':
             return OpenLicense()
+        else:
+            return Licenser(*args, **kwargs)
     except Exception as e:
         raise ValueError(_('Error importing License: %s') % e)
-
-
-def server_product_name():
-    return 'AWX' if isinstance(get_licenser(), OpenLicense) else 'Red Hat Ansible Automation Platform'

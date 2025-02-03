@@ -3,18 +3,24 @@ import pytest
 from unittest import mock
 import urllib.parse
 from unittest.mock import PropertyMock
+import importlib
 
 # Django
 from django.urls import resolve
 from django.http import Http404
+from django.apps import apps
 from django.core.handlers.exception import response_for_exception
 from django.contrib.auth.models import User
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db.backends.sqlite3.base import SQLiteCursorWrapper
 
+from django.db.models.signals import post_migrate
+
+from awx.main.migrations._dab_rbac import setup_managed_role_definitions
+
 # AWX
 from awx.main.models.projects import Project
-from awx.main.models.ha import Instance
+from awx.main.models.ha import Instance, InstanceGroup
 
 from rest_framework.test import (
     APIRequestFactory,
@@ -28,7 +34,6 @@ from awx.main.models.organization import (
     Organization,
     Team,
 )
-from awx.main.models.rbac import Role
 from awx.main.models.notifications import NotificationTemplate, Notification
 from awx.main.models.events import (
     JobEvent,
@@ -39,10 +44,18 @@ from awx.main.models.events import (
 )
 from awx.main.models.workflow import WorkflowJobTemplate
 from awx.main.models.ad_hoc_commands import AdHocCommand
-from awx.main.models.oauth import OAuth2Application as Application
 from awx.main.models.execution_environments import ExecutionEnvironment
+from awx.main.utils import is_testing
 
 __SWAGGER_REQUESTS__ = {}
+
+
+# HACK: the dab_resource_registry app required ServiceID in migrations which checks do not run
+dab_rr_initial = importlib.import_module('ansible_base.resource_registry.migrations.0001_initial')
+
+
+if is_testing():
+    post_migrate.connect(lambda **kwargs: dab_rr_initial.create_service_id(apps, None))
 
 
 @pytest.fixture(scope="session")
@@ -78,6 +91,17 @@ def deploy_jobtemplate(project, inventory, credential):
     return jt
 
 
+@pytest.fixture()
+def execution_environment():
+    return ExecutionEnvironment.objects.create(name="test-ee", description="test-ee", managed=True)
+
+
+@pytest.fixture
+def setup_managed_roles():
+    "Run the migration script to pre-create managed role definitions"
+    setup_managed_role_definitions(apps, None)
+
+
 @pytest.fixture
 def team(organization):
     return organization.teams.create(name='test-team')
@@ -88,20 +112,6 @@ def team_member(user, team):
     ret = user('team-member', False)
     team.member_role.members.add(ret)
     return ret
-
-
-@pytest.fixture(scope="session", autouse=True)
-def project_playbooks():
-    """
-    Return playbook_files as playbooks for manual projects when testing.
-    """
-
-    class PlaybooksMock(mock.PropertyMock):
-        def __get__(self, obj, obj_type):
-            return obj.playbook_files
-
-    mocked = mock.patch.object(Project, 'playbooks', new_callable=PlaybooksMock)
-    mocked.start()
 
 
 @pytest.fixture
@@ -174,12 +184,6 @@ def team_factory(organization):
         return t
 
     return factory
-
-
-@pytest.fixture
-def user_project(user):
-    owner = user('owner')
-    return Project.objects.create(name="test-user-project", created_by=owner, description="test-user-project-desc")
 
 
 @pytest.fixture
@@ -332,13 +336,6 @@ def inventory(organization):
 
 
 @pytest.fixture
-def insights_inventory(inventory):
-    inventory.scm_type = 'insights'
-    inventory.save()
-    return inventory
-
-
-@pytest.fixture
 def scm_inventory_source(inventory, project):
     inv_src = InventorySource(
         name="test-scm-inv",
@@ -421,7 +418,7 @@ def admin(user):
 @pytest.fixture
 def system_auditor(user):
     u = user('an-auditor', False)
-    Role.singleton('system_auditor').members.add(u)
+    u.is_system_auditor = True
     return u
 
 
@@ -485,23 +482,6 @@ def group_factory(inventory):
             return Group.objects.create(inventory=inventory, name=name)
 
     return g
-
-
-@pytest.fixture
-def hosts(group_factory):
-    group1 = group_factory('group-1')
-
-    def rf(host_count=1):
-        hosts = []
-        for i in range(0, host_count):
-            name = '%s-host-%s' % (group1.name, i)
-            (host, created) = group1.inventory.hosts.get_or_create(name=name)
-            if created:
-                group1.hosts.add(host)
-            hosts.append(host)
-        return hosts
-
-    return rf
 
 
 @pytest.fixture
@@ -711,6 +691,11 @@ def jt_linked(organization, project, inventory, machine_credential, credential, 
 
 
 @pytest.fixture
+def instance_group():
+    return InstanceGroup.objects.create(name="east")
+
+
+@pytest.fixture
 def workflow_job_template(organization):
     wjt = WorkflowJobTemplate.objects.create(name='test-workflow_job_template', organization=organization)
     wjt.save()
@@ -780,11 +765,6 @@ def get_db_prep_save(self, value, connection, **kwargs):
         value = dumps(value)
 
     return value
-
-
-@pytest.fixture
-def oauth_application(admin):
-    return Application.objects.create(name='test app', user=admin, client_type='confidential', authorization_grant_type='password')
 
 
 class MockCopy:

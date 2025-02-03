@@ -83,7 +83,7 @@ options:
       type: bool
     scm_update_on_launch:
       description:
-        - Before an update to the local repository before launching a job with this project.
+        - Perform an update to the local repository before launching a job with this project.
       type: bool
     scm_update_cache_timeout:
       description:
@@ -184,7 +184,7 @@ EXAMPLES = '''
     name: "Foo"
     description: "Foo bar project"
     organization: "test"
-    scm_update_on_launch: True
+    scm_update_on_launch: true
     scm_update_cache_timeout: 60
     state: present
     controller_config_file: "~/tower_cli.cfg"

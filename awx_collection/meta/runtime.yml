@@ -1,13 +1,13 @@
 ---
-requires_ansible: '>=2.9.10'
+requires_ansible: '>=2.15.0'
 action_groups:
   controller:
     - ad_hoc_command
     - ad_hoc_command_cancel
     - ad_hoc_command_wait
-    - application
     - bulk_job_launch
     - bulk_host_create
+    - bulk_host_delete
     - controller_meta
     - credential_input_source
     - credential
@@ -34,11 +34,13 @@ action_groups:
     - project
     - project_update
     - role
+    - role_definition
+    - role_team_assignment
+    - role_user_assignment
     - schedule
     - settings
     - subscriptions
     - team
-    - token
     - user
     - workflow_approval
     - workflow_job_template_node

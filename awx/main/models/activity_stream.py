@@ -77,11 +77,10 @@ class ActivityStream(models.Model):
     notification_template = models.ManyToManyField("NotificationTemplate", blank=True)
     notification = models.ManyToManyField("Notification", blank=True)
     label = models.ManyToManyField("Label", blank=True)
+    receptor_address = models.ManyToManyField("ReceptorAddress", blank=True)
     role = models.ManyToManyField("Role", blank=True)
     instance = models.ManyToManyField("Instance", blank=True)
     instance_group = models.ManyToManyField("InstanceGroup", blank=True)
-    o_auth2_application = models.ManyToManyField("OAuth2Application", blank=True)
-    o_auth2_access_token = models.ManyToManyField("OAuth2AccessToken", blank=True)
 
     setting = models.JSONField(default=dict, blank=True)
 

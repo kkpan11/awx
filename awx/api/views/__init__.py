@@ -33,11 +33,10 @@ from django.http import HttpResponse, HttpResponseRedirect
 from django.contrib.contenttypes.models import ContentType
 from django.utils.translation import gettext_lazy as _
 
-
 # Django REST Framework
 from rest_framework.exceptions import APIException, PermissionDenied, ParseError, NotFound
 from rest_framework.parsers import FormParser
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.renderers import JSONRenderer, StaticHTMLRenderer
 from rest_framework.response import Response
 from rest_framework.settings import api_settings
@@ -48,17 +47,16 @@ from rest_framework import status
 from rest_framework_yaml.parsers import YAMLParser
 from rest_framework_yaml.renderers import YAMLRenderer
 
-# ANSIConv
-import ansiconv
-
-# Python Social Auth
-from social_core.backends.utils import load_backends
-
-# Django OAuth Toolkit
-from oauth2_provider.models import get_access_token_model
+# ansi2html
+from ansi2html import Ansi2HTMLConverter
 
 import pytz
 from wsgiref.util import FileWrapper
+
+# django-ansible-base
+from ansible_base.lib.utils.requests import get_remote_hosts
+from ansible_base.rbac.models import RoleEvaluation, ObjectRole
+from ansible_base.resource_registry.shared_types import OrganizationType, TeamType, UserType
 
 # AWX
 from awx.main.tasks.system import send_notifications, update_inventory_computed_fields
@@ -87,6 +85,7 @@ from awx.api.generics import (
 from awx.api.views.labels import LabelSubListCreateAttachDetachView
 from awx.api.versioning import reverse
 from awx.main import models
+from awx.main.models.rbac import get_role_definition
 from awx.main.utils import (
     camelcase_to_underscore,
     extract_ansible_vars,
@@ -98,6 +97,7 @@ from awx.main.utils import (
 )
 from awx.main.utils.encryption import encrypt_value
 from awx.main.utils.filters import SmartFilter
+from awx.main.utils.plugins import compute_cloud_inventory_sources
 from awx.main.redact import UriCleaner
 from awx.api.permissions import (
     JobTemplateCallbackPermission,
@@ -128,6 +128,10 @@ logger = logging.getLogger('awx.api.views')
 
 
 def unpartitioned_event_horizon(cls):
+    with connection.cursor() as cursor:
+        cursor.execute(f"SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE table_name = '_unpartitioned_{cls._meta.db_table}';")
+        if not cursor.fetchone():
+            return 0
     with connection.cursor() as cursor:
         try:
             cursor.execute(f'SELECT MAX(id) FROM _unpartitioned_{cls._meta.db_table}')
@@ -268,16 +272,24 @@ class DashboardJobsGraphView(APIView):
 
         success_query = user_unified_jobs.filter(status='successful')
         failed_query = user_unified_jobs.filter(status='failed')
+        canceled_query = user_unified_jobs.filter(status='canceled')
+        error_query = user_unified_jobs.filter(status='error')
 
         if job_type == 'inv_sync':
             success_query = success_query.filter(instance_of=models.InventoryUpdate)
             failed_query = failed_query.filter(instance_of=models.InventoryUpdate)
+            canceled_query = canceled_query.filter(instance_of=models.InventoryUpdate)
+            error_query = error_query.filter(instance_of=models.InventoryUpdate)
         elif job_type == 'playbook_run':
             success_query = success_query.filter(instance_of=models.Job)
             failed_query = failed_query.filter(instance_of=models.Job)
+            canceled_query = canceled_query.filter(instance_of=models.Job)
+            error_query = error_query.filter(instance_of=models.Job)
         elif job_type == 'scm_update':
             success_query = success_query.filter(instance_of=models.ProjectUpdate)
             failed_query = failed_query.filter(instance_of=models.ProjectUpdate)
+            canceled_query = canceled_query.filter(instance_of=models.ProjectUpdate)
+            error_query = error_query.filter(instance_of=models.ProjectUpdate)
 
         end = now()
         interval = 'day'
@@ -293,10 +305,12 @@ class DashboardJobsGraphView(APIView):
         else:
             return Response({'error': _('Unknown period "%s"') % str(period)}, status=status.HTTP_400_BAD_REQUEST)
 
-        dashboard_data = {"jobs": {"successful": [], "failed": []}}
+        dashboard_data = {"jobs": {"successful": [], "failed": [], "canceled": [], "error": []}}
 
         succ_list = dashboard_data['jobs']['successful']
         fail_list = dashboard_data['jobs']['failed']
+        canceled_list = dashboard_data['jobs']['canceled']
+        error_list = dashboard_data['jobs']['error']
 
         qs_s = (
             success_query.filter(finished__range=(start, end))
@@ -314,6 +328,22 @@ class DashboardJobsGraphView(APIView):
             .annotate(agg=Count('id', distinct=True))
         )
         data_f = {item['d']: item['agg'] for item in qs_f}
+        qs_c = (
+            canceled_query.filter(finished__range=(start, end))
+            .annotate(d=Trunc('finished', interval, tzinfo=end.tzinfo))
+            .order_by()
+            .values('d')
+            .annotate(agg=Count('id', distinct=True))
+        )
+        data_c = {item['d']: item['agg'] for item in qs_c}
+        qs_e = (
+            error_query.filter(finished__range=(start, end))
+            .annotate(d=Trunc('finished', interval, tzinfo=end.tzinfo))
+            .order_by()
+            .values('d')
+            .annotate(agg=Count('id', distinct=True))
+        )
+        data_e = {item['d']: item['agg'] for item in qs_e}
 
         start_date = start.replace(hour=0, minute=0, second=0, microsecond=0)
         for d in itertools.count():
@@ -322,6 +352,8 @@ class DashboardJobsGraphView(APIView):
                 break
             succ_list.append([time.mktime(date.timetuple()), data_s.get(date, 0)])
             fail_list.append([time.mktime(date.timetuple()), data_f.get(date, 0)])
+            canceled_list.append([time.mktime(date.timetuple()), data_c.get(date, 0)])
+            error_list.append([time.mktime(date.timetuple()), data_e.get(date, 0)])
 
         return Response(dashboard_data)
 
@@ -333,25 +365,34 @@ class InstanceList(ListCreateAPIView):
     search_fields = ('hostname',)
     ordering = ('id',)
 
+    def get_queryset(self):
+        qs = super().get_queryset().prefetch_related('receptor_addresses')
+        return qs
+
 
 class InstanceDetail(RetrieveUpdateAPIView):
     name = _("Instance Detail")
     model = models.Instance
     serializer_class = serializers.InstanceSerializer
 
+    def get_queryset(self):
+        qs = super().get_queryset().prefetch_related('receptor_addresses')
+        return qs
+
     def update_raw_data(self, data):
         # these fields are only valid on creation of an instance, so they unwanted on detail view
-        data.pop('listener_port', None)
         data.pop('node_type', None)
         data.pop('hostname', None)
+        data.pop('ip_address', None)
         return super(InstanceDetail, self).update_raw_data(data)
 
     def update(self, request, *args, **kwargs):
         r = super(InstanceDetail, self).update(request, *args, **kwargs)
         if status.is_success(r.status_code):
             obj = self.get_object()
-            obj.set_capacity_value()
-            obj.save(update_fields=['capacity'])
+            capacity_changed = obj.set_capacity_value()
+            if capacity_changed:
+                obj.save(update_fields=['capacity'])
             r.data = serializers.InstanceSerializer(obj, context=self.get_serializer_context()).to_representation(obj)
         return r
 
@@ -370,13 +411,37 @@ class InstanceUnifiedJobsList(SubListAPIView):
 
 
 class InstancePeersList(SubListAPIView):
-    name = _("Instance Peers")
+    name = _("Peers")
+    model = models.ReceptorAddress
+    serializer_class = serializers.ReceptorAddressSerializer
     parent_model = models.Instance
-    model = models.Instance
-    serializer_class = serializers.InstanceSerializer
     parent_access = 'read'
-    search_fields = {'hostname'}
     relationship = 'peers'
+    search_fields = ('address',)
+
+
+class InstanceReceptorAddressesList(SubListAPIView):
+    name = _("Receptor Addresses")
+    model = models.ReceptorAddress
+    parent_key = 'instance'
+    parent_model = models.Instance
+    serializer_class = serializers.ReceptorAddressSerializer
+    search_fields = ('address',)
+
+
+class ReceptorAddressesList(ListAPIView):
+    name = _("Receptor Addresses")
+    model = models.ReceptorAddress
+    serializer_class = serializers.ReceptorAddressSerializer
+    search_fields = ('address',)
+
+
+class ReceptorAddressDetail(RetrieveAPIView):
+    name = _("Receptor Address Detail")
+    model = models.ReceptorAddress
+    serializer_class = serializers.ReceptorAddressSerializer
+    parent_model = models.Instance
+    relationship = 'receptor_addresses'
 
 
 class InstanceInstanceGroupsList(InstanceGroupMembershipMixin, SubListCreateAttachDetachAPIView):
@@ -471,6 +536,7 @@ class InstanceGroupAccessList(ResourceAccessList):
 
 
 class InstanceGroupObjectRolesList(SubListAPIView):
+    deprecated = True
     model = models.Role
     serializer_class = serializers.RoleSerializer
     parent_model = models.InstanceGroup
@@ -605,51 +671,81 @@ class ScheduleUnifiedJobsList(SubListAPIView):
     name = _('Schedule Jobs List')
 
 
-class AuthView(APIView):
-    '''List enabled single-sign-on endpoints'''
+def immutablesharedfields(cls):
+    '''
+    Class decorator to prevent modifying shared resources when ALLOW_LOCAL_RESOURCE_MANAGEMENT setting is set to False.
 
-    authentication_classes = []
-    permission_classes = (AllowAny,)
-    swagger_topic = 'System Configuration'
+    Works by overriding these view methods:
+    - create
+    - delete
+    - perform_update
+    create and delete are overridden to raise a PermissionDenied exception.
+    perform_update is overridden to check if any shared fields are being modified,
+    and raise a PermissionDenied exception if so.
+    '''
+    # create instead of perform_create because some of our views
+    # override create instead of perform_create
+    if hasattr(cls, 'create'):
+        cls.original_create = cls.create
 
-    def get(self, request):
-        from rest_framework.reverse import reverse
+        @functools.wraps(cls.create)
+        def create_wrapper(*args, **kwargs):
+            if settings.ALLOW_LOCAL_RESOURCE_MANAGEMENT:
+                return cls.original_create(*args, **kwargs)
+            raise PermissionDenied({'detail': _('Creation of this resource is not allowed. Create this resource via the platform ingress.')})
 
-        data = OrderedDict()
-        err_backend, err_message = request.session.get('social_auth_error', (None, None))
-        auth_backends = list(load_backends(settings.AUTHENTICATION_BACKENDS, force_load=True).items())
-        # Return auth backends in consistent order: Google, GitHub, SAML.
-        auth_backends.sort(key=lambda x: 'g' if x[0] == 'google-oauth2' else x[0])
-        for name, backend in auth_backends:
-            login_url = reverse('social:begin', args=(name,))
-            complete_url = request.build_absolute_uri(reverse('social:complete', args=(name,)))
-            backend_data = {'login_url': login_url, 'complete_url': complete_url}
-            if name == 'saml':
-                backend_data['metadata_url'] = reverse('sso:saml_metadata')
-                for idp in sorted(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS.keys()):
-                    saml_backend_data = dict(backend_data.items())
-                    saml_backend_data['login_url'] = '%s?idp=%s' % (login_url, idp)
-                    full_backend_name = '%s:%s' % (name, idp)
-                    if (err_backend == full_backend_name or err_backend == name) and err_message:
-                        saml_backend_data['error'] = err_message
-                    data[full_backend_name] = saml_backend_data
-            else:
-                if err_backend == name and err_message:
-                    backend_data['error'] = err_message
-                data[name] = backend_data
-        return Response(data)
+        cls.create = create_wrapper
+
+    if hasattr(cls, 'delete'):
+        cls.original_delete = cls.delete
+
+        @functools.wraps(cls.delete)
+        def delete_wrapper(*args, **kwargs):
+            if settings.ALLOW_LOCAL_RESOURCE_MANAGEMENT:
+                return cls.original_delete(*args, **kwargs)
+            raise PermissionDenied({'detail': _('Deletion of this resource is not allowed. Delete this resource via the platform ingress.')})
+
+        cls.delete = delete_wrapper
+
+    if hasattr(cls, 'perform_update'):
+        cls.original_perform_update = cls.perform_update
+
+        @functools.wraps(cls.perform_update)
+        def update_wrapper(*args, **kwargs):
+            if not settings.ALLOW_LOCAL_RESOURCE_MANAGEMENT:
+                view, serializer = args
+                instance = view.get_object()
+                if instance:
+                    if isinstance(instance, models.Organization):
+                        shared_fields = OrganizationType._declared_fields.keys()
+                    elif isinstance(instance, models.User):
+                        shared_fields = UserType._declared_fields.keys()
+                    elif isinstance(instance, models.Team):
+                        shared_fields = TeamType._declared_fields.keys()
+                    attrs = serializer.validated_data
+                    for field in shared_fields:
+                        if field in attrs and getattr(instance, field) != attrs[field]:
+                            raise PermissionDenied({field: _(f"Cannot change shared field '{field}'. Alter this field via the platform ingress.")})
+            return cls.original_perform_update(*args, **kwargs)
+
+        cls.perform_update = update_wrapper
+
+    return cls
 
 
+@immutablesharedfields
 class TeamList(ListCreateAPIView):
     model = models.Team
     serializer_class = serializers.TeamSerializer
 
 
+@immutablesharedfields
 class TeamDetail(RetrieveUpdateDestroyAPIView):
     model = models.Team
     serializer_class = serializers.TeamSerializer
 
 
+@immutablesharedfields
 class TeamUsersList(BaseUsersList):
     model = models.User
     serializer_class = serializers.UserSerializer
@@ -659,6 +755,7 @@ class TeamUsersList(BaseUsersList):
 
 
 class TeamRolesList(SubListAttachDetachAPIView):
+    deprecated = True
     model = models.Role
     serializer_class = serializers.RoleSerializerWithParentAccess
     metadata_class = RoleMetadata
@@ -698,10 +795,12 @@ class TeamRolesList(SubListAttachDetachAPIView):
 
 
 class TeamObjectRolesList(SubListAPIView):
+    deprecated = True
     model = models.Role
     serializer_class = serializers.RoleSerializer
     parent_model = models.Team
     search_fields = ('role_field', 'content_type__model')
+    deprecated = True
 
     def get_queryset(self):
         po = self.get_parent_object()
@@ -719,8 +818,15 @@ class TeamProjectsList(SubListAPIView):
         self.check_parent_access(team)
         model_ct = ContentType.objects.get_for_model(self.model)
         parent_ct = ContentType.objects.get_for_model(self.parent_model)
-        proj_roles = models.Role.objects.filter(Q(ancestors__content_type=parent_ct) & Q(ancestors__object_id=team.pk), content_type=model_ct)
-        return self.model.accessible_objects(self.request.user, 'read_role').filter(pk__in=[t.content_object.pk for t in proj_roles])
+
+        rd = get_role_definition(team.member_role)
+        role = ObjectRole.objects.filter(object_id=team.id, content_type=parent_ct, role_definition=rd).first()
+        if role is None:
+            # Team has no permissions, therefore team has no projects
+            return self.model.objects.none()
+        else:
+            project_qs = self.model.accessible_objects(self.request.user, 'read_role')
+            return project_qs.filter(id__in=RoleEvaluation.objects.filter(content_type_id=model_ct.id, role=role).values_list('object_id'))
 
 
 class TeamActivityStreamList(SubListAPIView):
@@ -735,10 +841,23 @@ class TeamActivityStreamList(SubListAPIView):
         self.check_parent_access(parent)
 
         qs = self.request.user.get_queryset(self.model)
+
         return qs.filter(
             Q(team=parent)
-            | Q(project__in=models.Project.accessible_objects(parent, 'read_role'))
-            | Q(credential__in=models.Credential.accessible_objects(parent, 'read_role'))
+            | Q(
+                project__in=RoleEvaluation.objects.filter(
+                    role__in=parent.has_roles.all(), content_type_id=ContentType.objects.get_for_model(models.Project).id, codename='view_project'
+                )
+                .values_list('object_id')
+                .distinct()
+            )
+            | Q(
+                credential__in=RoleEvaluation.objects.filter(
+                    role__in=parent.has_roles.all(), content_type_id=ContentType.objects.get_for_model(models.Credential).id, codename='view_credential'
+                )
+                .values_list('object_id')
+                .distinct()
+            )
         )
 
 
@@ -990,10 +1109,12 @@ class ProjectAccessList(ResourceAccessList):
 
 
 class ProjectObjectRolesList(SubListAPIView):
+    deprecated = True
     model = models.Role
     serializer_class = serializers.RoleSerializer
     parent_model = models.Project
     search_fields = ('role_field', 'content_type__model')
+    deprecated = True
 
     def get_queryset(self):
         po = self.get_parent_object()
@@ -1006,6 +1127,7 @@ class ProjectCopy(CopyAPIView):
     copy_return_serializer_class = serializers.ProjectSerializer
 
 
+@immutablesharedfields
 class UserList(ListCreateAPIView):
     model = models.User
     serializer_class = serializers.UserSerializer
@@ -1023,121 +1145,6 @@ class UserMeList(ListAPIView):
         return self.model.objects.filter(pk=self.request.user.pk)
 
 
-class OAuth2ApplicationList(ListCreateAPIView):
-    name = _("OAuth 2 Applications")
-
-    model = models.OAuth2Application
-    serializer_class = serializers.OAuth2ApplicationSerializer
-    swagger_topic = 'Authentication'
-
-
-class OAuth2ApplicationDetail(RetrieveUpdateDestroyAPIView):
-    name = _("OAuth 2 Application Detail")
-
-    model = models.OAuth2Application
-    serializer_class = serializers.OAuth2ApplicationSerializer
-    swagger_topic = 'Authentication'
-
-    def update_raw_data(self, data):
-        data.pop('client_secret', None)
-        return super(OAuth2ApplicationDetail, self).update_raw_data(data)
-
-
-class ApplicationOAuth2TokenList(SubListCreateAPIView):
-    name = _("OAuth 2 Application Tokens")
-
-    model = models.OAuth2AccessToken
-    serializer_class = serializers.OAuth2TokenSerializer
-    parent_model = models.OAuth2Application
-    relationship = 'oauth2accesstoken_set'
-    parent_key = 'application'
-    swagger_topic = 'Authentication'
-
-
-class OAuth2ApplicationActivityStreamList(SubListAPIView):
-    model = models.ActivityStream
-    serializer_class = serializers.ActivityStreamSerializer
-    parent_model = models.OAuth2Application
-    relationship = 'activitystream_set'
-    swagger_topic = 'Authentication'
-    search_fields = ('changes',)
-
-
-class OAuth2TokenList(ListCreateAPIView):
-    name = _("OAuth2 Tokens")
-
-    model = models.OAuth2AccessToken
-    serializer_class = serializers.OAuth2TokenSerializer
-    swagger_topic = 'Authentication'
-
-
-class OAuth2UserTokenList(SubListCreateAPIView):
-    name = _("OAuth2 User Tokens")
-
-    model = models.OAuth2AccessToken
-    serializer_class = serializers.OAuth2TokenSerializer
-    parent_model = models.User
-    relationship = 'main_oauth2accesstoken'
-    parent_key = 'user'
-    swagger_topic = 'Authentication'
-
-
-class UserAuthorizedTokenList(SubListCreateAPIView):
-    name = _("OAuth2 User Authorized Access Tokens")
-
-    model = models.OAuth2AccessToken
-    serializer_class = serializers.UserAuthorizedTokenSerializer
-    parent_model = models.User
-    relationship = 'oauth2accesstoken_set'
-    parent_key = 'user'
-    swagger_topic = 'Authentication'
-
-    def get_queryset(self):
-        return get_access_token_model().objects.filter(application__isnull=False, user=self.request.user)
-
-
-class OrganizationApplicationList(SubListCreateAPIView):
-    name = _("Organization OAuth2 Applications")
-
-    model = models.OAuth2Application
-    serializer_class = serializers.OAuth2ApplicationSerializer
-    parent_model = models.Organization
-    relationship = 'applications'
-    parent_key = 'organization'
-    swagger_topic = 'Authentication'
-
-
-class UserPersonalTokenList(SubListCreateAPIView):
-    name = _("OAuth2 Personal Access Tokens")
-
-    model = models.OAuth2AccessToken
-    serializer_class = serializers.UserPersonalTokenSerializer
-    parent_model = models.User
-    relationship = 'main_oauth2accesstoken'
-    parent_key = 'user'
-    swagger_topic = 'Authentication'
-
-    def get_queryset(self):
-        return get_access_token_model().objects.filter(application__isnull=True, user=self.request.user)
-
-
-class OAuth2TokenDetail(RetrieveUpdateDestroyAPIView):
-    name = _("OAuth Token Detail")
-
-    model = models.OAuth2AccessToken
-    serializer_class = serializers.OAuth2TokenDetailSerializer
-    swagger_topic = 'Authentication'
-
-
-class OAuth2TokenActivityStreamList(SubListAPIView):
-    model = models.ActivityStream
-    serializer_class = serializers.ActivityStreamSerializer
-    parent_model = models.OAuth2AccessToken
-    relationship = 'activitystream_set'
-    swagger_topic = 'Authentication'
-    search_fields = ('changes',)
-
-
 class UserTeamsList(SubListAPIView):
     model = models.Team
     serializer_class = serializers.TeamSerializer
@@ -1151,6 +1158,7 @@ class UserTeamsList(SubListAPIView):
 
 
 class UserRolesList(SubListAttachDetachAPIView):
+    deprecated = True
     model = models.Role
     serializer_class = serializers.RoleSerializerWithParentAccess
     metadata_class = RoleMetadata
@@ -1175,7 +1183,16 @@ class UserRolesList(SubListAttachDetachAPIView):
         user = get_object_or_400(models.User, pk=self.kwargs['pk'])
         role = get_object_or_400(models.Role, pk=sub_id)
 
-        credential_content_type = ContentType.objects.get_for_model(models.Credential)
+        content_types = ContentType.objects.get_for_models(models.Organization, models.Team, models.Credential)  # dict of {model: content_type}
+        # Prevent user to be associated with team/org when ALLOW_LOCAL_RESOURCE_MANAGEMENT is False
+        if not settings.ALLOW_LOCAL_RESOURCE_MANAGEMENT:
+            for model in [models.Organization, models.Team]:
+                ct = content_types[model]
+                if role.content_type == ct and role.role_field in ['member_role', 'admin_role']:
+                    data = dict(msg=_(f"Cannot directly modify user membership to {ct.model}. Direct shared resource management disabled"))
+                    return Response(data, status=status.HTTP_403_FORBIDDEN)
+
+        credential_content_type = content_types[models.Credential]
         if role.content_type == credential_content_type:
             if 'disassociate' not in request.data and role.content_object.organization and user not in role.content_object.organization.member_role:
                 data = dict(msg=_("You cannot grant credential access to a user not in the credentials' organization"))
@@ -1247,6 +1264,7 @@ class UserActivityStreamList(SubListAPIView):
         return qs.filter(Q(actor=parent) | Q(user__in=[parent]))
 
 
+@immutablesharedfields
 class UserDetail(RetrieveUpdateDestroyAPIView):
     model = models.User
     serializer_class = serializers.UserSerializer
@@ -1392,7 +1410,7 @@ class OrganizationCredentialList(SubListCreateAPIView):
         self.check_parent_access(organization)
 
         user_visible = models.Credential.accessible_objects(self.request.user, 'read_role').all()
-        org_set = models.Credential.accessible_objects(organization.admin_role, 'read_role').all()
+        org_set = models.Credential.objects.filter(organization=organization)
 
         if self.request.user.is_superuser or self.request.user.is_system_auditor:
             return org_set
@@ -1425,10 +1443,12 @@ class CredentialAccessList(ResourceAccessList):
 
 
 class CredentialObjectRolesList(SubListAPIView):
+    deprecated = True
     model = models.Role
     serializer_class = serializers.RoleSerializer
     parent_model = models.Credential
     search_fields = ('role_field', 'content_type__model')
+    deprecated = True
 
     def get_queryset(self):
         po = self.get_parent_object()
@@ -2059,9 +2079,9 @@ class InventorySourceNotificationTemplatesAnyList(SubListCreateAttachDetachAPIVi
 
     def post(self, request, *args, **kwargs):
         parent = self.get_parent_object()
-        if parent.source not in models.CLOUD_INVENTORY_SOURCES:
+        if parent.source not in compute_cloud_inventory_sources():
             return Response(
-                dict(msg=_("Notification Templates can only be assigned when source is one of {}.").format(models.CLOUD_INVENTORY_SOURCES, parent.source)),
+                dict(msg=_("Notification Templates can only be assigned when source is one of {}.").format(compute_cloud_inventory_sources(), parent.source)),
                 status=status.HTTP_400_BAD_REQUEST,
             )
         return super(InventorySourceNotificationTemplatesAnyList, self).post(request, *args, **kwargs)
@@ -2215,12 +2235,16 @@ class JobTemplateList(ListCreateAPIView):
     serializer_class = serializers.JobTemplateSerializer
     always_allow_superuser = False
 
-    def post(self, request, *args, **kwargs):
-        ret = super(JobTemplateList, self).post(request, *args, **kwargs)
-        if ret.status_code == 201:
-            job_template = models.JobTemplate.objects.get(id=ret.data['id'])
-            job_template.admin_role.members.add(request.user)
-        return ret
+    def check_permissions(self, request):
+        if request.method == 'POST':
+            if request.user.is_anonymous:
+                self.permission_denied(request)
+            else:
+                can_access, messages = request.user.can_access_with_errors(self.model, 'add', request.data)
+                if not can_access:
+                    self.permission_denied(request, message=messages)
+
+        super(JobTemplateList, self).check_permissions(request)
 
 
 class JobTemplateDetail(RelatedJobsPreventDeleteMixin, RetrieveUpdateDestroyAPIView):
@@ -2601,12 +2625,7 @@ class JobTemplateCallback(GenericAPIView):
         host for the current request.
         """
         # Find the list of remote host names/IPs to check.
-        remote_hosts = set()
-        for header in settings.REMOTE_HOST_HEADERS:
-            for value in self.request.META.get(header, '').split(','):
-                value = value.strip()
-                if value:
-                    remote_hosts.add(value)
+        remote_hosts = set(get_remote_hosts(self.request))
         # Add the reverse lookup of IP addresses.
         for rh in list(remote_hosts):
             try:
@@ -2767,10 +2786,12 @@ class JobTemplateAccessList(ResourceAccessList):
 
 
 class JobTemplateObjectRolesList(SubListAPIView):
+    deprecated = True
     model = models.Role
     serializer_class = serializers.RoleSerializer
     parent_model = models.JobTemplate
     search_fields = ('role_field', 'content_type__model')
+    deprecated = True
 
     def get_queryset(self):
         po = self.get_parent_object()
@@ -2943,6 +2964,17 @@ class WorkflowJobTemplateList(ListCreateAPIView):
     model = models.WorkflowJobTemplate
     serializer_class = serializers.WorkflowJobTemplateSerializer
     always_allow_superuser = False
+
+    def check_permissions(self, request):
+        if request.method == 'POST':
+            if request.user.is_anonymous:
+                self.permission_denied(request)
+            else:
+                can_access, messages = request.user.can_access_with_errors(self.model, 'add', request.data)
+                if not can_access:
+                    self.permission_denied(request, message=messages)
+
+        super(WorkflowJobTemplateList, self).check_permissions(request)
 
 
 class WorkflowJobTemplateDetail(RelatedJobsPreventDeleteMixin, RetrieveUpdateDestroyAPIView):
@@ -3153,10 +3185,12 @@ class WorkflowJobTemplateAccessList(ResourceAccessList):
 
 
 class WorkflowJobTemplateObjectRolesList(SubListAPIView):
+    deprecated = True
     model = models.Role
     serializer_class = serializers.RoleSerializer
     parent_model = models.WorkflowJobTemplate
     search_fields = ('role_field', 'content_type__model')
+    deprecated = True
 
     def get_queryset(self):
         po = self.get_parent_object()
@@ -4020,7 +4054,8 @@ class UnifiedJobStdout(RetrieveAPIView):
                 # Remove any ANSI escape sequences containing job event data.
                 content = re.sub(r'\x1b\[K(?:[A-Za-z0-9+/=]+\x1b\[\d+D)+\x1b\[K', '', content)
 
-                body = ansiconv.to_html(html.escape(content))
+                conv = Ansi2HTMLConverter()
+                body = conv.convert(html.escape(content))
 
                 context = {'title': get_view_name(self.__class__), 'body': mark_safe(body), 'dark': dark_bg, 'content_only': content_only}
                 data = render_to_string('api/stdout.html', context).strip()
@@ -4165,6 +4200,7 @@ class ActivityStreamDetail(RetrieveAPIView):
 
 
 class RoleList(ListAPIView):
+    deprecated = True
     model = models.Role
     serializer_class = serializers.RoleSerializer
     permission_classes = (IsAuthenticated,)
@@ -4172,11 +4208,13 @@ class RoleList(ListAPIView):
 
 
 class RoleDetail(RetrieveAPIView):
+    deprecated = True
     model = models.Role
     serializer_class = serializers.RoleSerializer
 
 
 class RoleUsersList(SubListAttachDetachAPIView):
+    deprecated = True
     model = models.User
     serializer_class = serializers.UserSerializer
     parent_model = models.Role
@@ -4197,7 +4235,15 @@ class RoleUsersList(SubListAttachDetachAPIView):
         user = get_object_or_400(models.User, pk=sub_id)
         role = self.get_parent_object()
 
-        credential_content_type = ContentType.objects.get_for_model(models.Credential)
+        content_types = ContentType.objects.get_for_models(models.Organization, models.Team, models.Credential)  # dict of {model: content_type}
+        if not settings.ALLOW_LOCAL_RESOURCE_MANAGEMENT:
+            for model in [models.Organization, models.Team]:
+                ct = content_types[model]
+                if role.content_type == ct and role.role_field in ['member_role', 'admin_role']:
+                    data = dict(msg=_(f"Cannot directly modify user membership to {ct.model}. Direct shared resource management disabled"))
+                    return Response(data, status=status.HTTP_403_FORBIDDEN)
+
+        credential_content_type = content_types[models.Credential]
         if role.content_type == credential_content_type:
             if 'disassociate' not in request.data and role.content_object.organization and user not in role.content_object.organization.member_role:
                 data = dict(msg=_("You cannot grant credential access to a user not in the credentials' organization"))
@@ -4211,6 +4257,7 @@ class RoleUsersList(SubListAttachDetachAPIView):
 
 
 class RoleTeamsList(SubListAttachDetachAPIView):
+    deprecated = True
     model = models.Team
     serializer_class = serializers.TeamSerializer
     parent_model = models.Role
@@ -4255,10 +4302,12 @@ class RoleTeamsList(SubListAttachDetachAPIView):
             team.member_role.children.remove(role)
         else:
             team.member_role.children.add(role)
+
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class RoleParentsList(SubListAPIView):
+    deprecated = True
     model = models.Role
     serializer_class = serializers.RoleSerializer
     parent_model = models.Role
@@ -4272,6 +4321,7 @@ class RoleParentsList(SubListAPIView):
 
 
 class RoleChildrenList(SubListAPIView):
+    deprecated = True
     model = models.Role
     serializer_class = serializers.RoleSerializer
     parent_model = models.Role

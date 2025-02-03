@@ -28,6 +28,14 @@
     ig2: "AWX-Collection-tests-workflow_job_template-ig2-{{ test_id }}"
     host1: "AWX-Collection-tests-workflow_job_template-h1-{{ test_id }}"
 
+- name: detect credential types
+  ansible.builtin.set_fact:
+    credentials: "{{ lookup('awx.awx.controller_api', 'credential_types') }}"
+
+- name: Register Credentials found
+  set_fact:
+    github_found: "{{ 'Github Personal Access Token' in credentials | map(attribute='name') | list }}"
+
 - block:
     - name: "Create a new organization"
       organization:
@@ -36,21 +44,29 @@
           - Ansible Galaxy
       register: result
 
-    - name: Create Credentials
+    - name: Create SCM Credential
       credential:
-        name: "{{ item.name }}"
+        name: "{{ scm_cred_name }}"
         organization: Default
-        credential_type: "{{ item.type }}"
+        credential_type: Source Control
       register: result
-      loop:
-        - name: "{{ scm_cred_name }}"
-          type: Source Control
-        - name: "{{ github_webhook_credential_name }}"
-          type: GitHub Personal Access Token
 
     - assert:
         that:
           - "result is changed"
+
+    - name: Create Github PAT Credential
+      credential:
+        name: "{{ github_webhook_credential_name }}"
+        organization: Default
+        credential_type: Github Personal Access Token
+      register: result
+      when: github_found
+
+    - assert:
+        that:
+          - "result is changed"
+      when: github_found
 
     - name: Add email notification
       notification_template:
@@ -169,6 +185,9 @@
         name: "{{ jt1_name }}"
         project: "{{ demo_project_name }}"
         inventory: Demo Inventory
+        ask_inventory_on_launch: true
+        ask_credential_on_launch: true
+        ask_labels_on_launch: true
         playbook: hello_world.yml
         job_type: run
         state: present
@@ -710,7 +729,7 @@
         name: "{{ wfjt_name }}"
         inventory: Demo Inventory
         extra_vars: {'foo': 'bar', 'another-foo': {'barz': 'bar2'}}
-        schema:
+        workflow_nodes:
           - identifier: node101
             unified_job_template:
               name: "{{ project_inv_source_result.id }}"
@@ -721,30 +740,52 @@
             related:
               failure_nodes:
                 - identifier: node201
+          - identifier: node102
+            unified_job_template:
+              organization:
+                name: "{{ org_name }}"
+              name: "{{ demo_project_name_2 }}"
+              type: project
+            related:
+              success_nodes:
+                - identifier: node201
           - identifier: node201
             unified_job_template:
               organization:
                 name: Default
               name: "{{ jt1_name }}"
               type: job_template
-            credentials: []
+            inventory:
+              name: Demo Inventory
+              organization:
+                name: Default
             related:
               success_nodes:
+                - identifier: node401
+              failure_nodes:
                 - identifier: node301
-          - identifier: node202
-            unified_job_template:
-              organization:
-                name: "{{ org_name }}"
-              name: "{{ project_inv_source }}"
-              type: project
+              always_nodes: []
+              credentials:
+                - name: "{{ scm_cred_name }}"
+                  organization:
+                    name: Default
+              instance_groups:
+                - name: "{{ ig1 }}"
+              labels:
+                - name: "{{ lab1 }}"
+                  organization:
+                    name: "{{ org_name }}"
           - all_parents_must_converge: false
             identifier: node301
             unified_job_template:
-              organization:
-                name: Default
-              name: "{{ jt2_name }}"
-              type: job_template
-          - identifier: Cleanup Job
+              description: Approval node for example
+              timeout: 900
+              type: workflow_approval
+              name: "{{ approval_node_name }}"
+            related:
+              success_nodes:
+                - identifier: node401
+          - identifier: node401
             unified_job_template:
               name: Cleanup Activity Stream
               type: system_job_template
@@ -842,8 +883,8 @@
         name: "{{ webhook_wfjt_name }}"
         organization: Default
         inventory: Demo Inventory
-        webhook_service: gitlab
-        webhook_credential: "{{ github_webhook_credential_name }}"
+        webhook_service: "{{ 'gitlab' if github_found else omit }}"
+        webhook_credential: "{{ github_webhook_credential_name if github_found else omit }}"
       ignore_errors: true
       register: result
 
@@ -851,14 +892,15 @@
         that:
           - result is failed
           - "'Must match the selected webhook service' in result['msg']"
+      when: github_found and gitlab_found
 
     - name: Create a workflow job template with a GitHub webhook and a GitHub credential
       workflow_job_template:
         name: "{{ webhook_wfjt_name }}"
         organization: Default
         inventory: Demo Inventory
-        webhook_service: github
-        webhook_credential: "{{ github_webhook_credential_name }}"
+        webhook_service: "{{ 'github' if github_found else omit }}"
+        webhook_credential: "{{ github_webhook_credential_name if github_found else omit }}"
       register: result
 
     - assert:

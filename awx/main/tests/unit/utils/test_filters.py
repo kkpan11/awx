@@ -68,7 +68,9 @@ class mockHost:
 
 @mock.patch('awx.main.utils.filters.get_model', return_value=mockHost())
 class TestSmartFilterQueryFromString:
-    @mock.patch('awx.api.filters.get_fields_from_path', lambda model, path: ([model], path))  # disable field filtering, because a__b isn't a real Host field
+    @mock.patch(
+        'ansible_base.rest_filters.rest_framework.field_lookup_backend.get_fields_from_path', lambda model, path, **kwargs: ([model], path)
+    )  # disable field filtering, because a__b isn't a real Host field
     @pytest.mark.parametrize(
         "filter_string,q_expected",
         [
@@ -116,8 +118,8 @@ class TestSmartFilterQueryFromString:
     @pytest.mark.parametrize(
         "filter_string,q_expected",
         [
-            (u'(a=abc\u1F5E3def)', Q(**{u"a": u"abc\u1F5E3def"})),
-            (u'(ansible_facts__a=abc\u1F5E3def)', Q(**{u"ansible_facts__contains": {u"a": u"abc\u1F5E3def"}})),
+            (u'(a=abc\u1f5e3def)', Q(**{u"a": u"abc\u1f5e3def"})),
+            (u'(ansible_facts__a=abc\u1f5e3def)', Q(**{u"ansible_facts__contains": {u"a": u"abc\u1f5e3def"}})),
         ],
     )
     def test_unicode(self, mock_get_host_model, filter_string, q_expected):
